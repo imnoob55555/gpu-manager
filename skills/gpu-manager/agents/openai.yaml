@@ -1,0 +1,6 @@
+interface:
+  display_name: "GPU Manager"
+  short_description: "查 GPU 空闲、提交/排队训练任务、看进度与看门狗诊断"
+  default_prompt: >-
+    Use $gpu-manager to check GPU status, submit or inspect training tasks on
+    this shared server, check progress, and diagnose stalled jobs.

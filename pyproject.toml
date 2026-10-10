@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gpu-manager"
+version = "1.0.0"
+description = "共享 GPU 服务器上的个人空闲提醒 + 训练任务自动调度（只服务当前用户，不对他人进程发信号）"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Godhao", email = "imnoob55555@users.noreply.github.com" }]
+keywords = ["gpu", "scheduler", "training", "task-queue", "feishu", "monitoring"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Monitoring",
+]
+dependencies = [
+    "PyYAML>=6.0",
+    "filelock>=3.0",
+    "requests>=2.25",
+]
+
+[project.urls]
+Homepage = "https://github.com/imnoob55555/gpu-manager"
+Repository = "https://github.com/imnoob55555/gpu-manager"
+Issues = "https://github.com/imnoob55555/gpu-manager/issues"
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+# 安装后可直接使用 `gpu-manager ...`（也可以不安装，用 ./bin/gpu-manager）
+gpu-manager = "gpu_manager.cli:main"
+
+[tool.setuptools]
+packages = ["gpu_manager"]
+
+[tool.setuptools.package-data]
+gpu_manager = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

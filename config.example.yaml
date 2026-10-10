@@ -1,0 +1,217 @@
+---
+# ============================================================================
+# GPU Manager 配置文件
+#
+# 所有阈值都可调；改完执行 `gpu-manager reload` 即可生效（无需重启 daemon）。
+# 相对路径均以本文件所在目录为基准。
+# ============================================================================
+
+server:
+  # 仅用于通知内容与日志归属，不参与任何系统级操作
+  name: ""              # 留空自动取 hostname
+  user: ""              # 留空自动取 $USER
+
+# ---------------------------------------------------------------------------
+# GPU 监控与空闲判定（需求 §5 / §6 / §8）
+# ---------------------------------------------------------------------------
+gpu:
+  # --- 空闲判定阈值 ---
+  # 不能只看 utilization==0：checkpoint 保存、DataLoader 等待、评估切换都会让 util 瞬时掉 0
+  max_idle_utilization: 5        # 利用率 <= 5% 视为不忙
+  max_idle_memory_mb: 1000       # 已用显存 <= 1000MiB 视为未被占住
+  require_no_compute_process: true   # 有 compute 进程就一定不算空闲（Xorg 图形进程会自动忽略）
+
+  # --- 连续空闲确认 ---
+  check_interval_seconds: 30     # 每轮检查间隔
+  idle_confirm_checks: 3         # 连续 3 次满足才算「确认空闲」（≈90 秒）
+
+  ignore_graphics_processes: true    # 忽略 Xorg 等图形进程（它们不占计算资源）
+
+  # --- GPU 使用范围 ---
+  # monitor_gpus: 哪些卡参与「空闲提醒」观察。all = 全部
+  monitor_gpus: all
+
+  # scheduler_allowed_gpus: 哪些卡允许被自动调度占用。all = 全部
+  # 例：只允许用 4/5/6/7 号卡自动跑训练 → 取消下面注释
+  # scheduler_allowed_gpus: [4, 5, 6, 7]
+  scheduler_allowed_gpus: all
+
+  # reserved_gpus: 永远不参与自动调度（即使列在 scheduler_allowed_gpus 里也无效）
+  # 例: reserved_gpus: [7]
+  reserved_gpus: []
+
+  # own_users: 额外视为「自己」的用户名白名单（留空 = 只认当前用户）
+  own_users: []
+
+# ---------------------------------------------------------------------------
+# 调度策略（需求 §13）
+# ---------------------------------------------------------------------------
+scheduler:
+  strategy: priority_first_fit      # priority 降序 + first fit（同优先级 FIFO）
+  max_concurrent_tasks: 0           # 0 = 不限；>0 时最多同时运行这么多个任务
+
+  launch_second_check: true         # 启动前二次 nvidia-smi 复核（多人服务器必备，需求 §7）
+  grace_before_reuse_seconds: 20    # 任务刚结束后，其 GPU 在此时长内不再复用（等残留进程退干净）
+
+  allow_cpu_tasks: false            # 是否允许 gpu_num=0 的纯 CPU 任务
+  queue_notify: true                # 排队久了是否周期提醒
+  waiting_notify_interval_seconds: 3600   # 排队提醒间隔（秒）
+
+# ---------------------------------------------------------------------------
+# 通知内容开关与去重（需求 §1）
+# ---------------------------------------------------------------------------
+notify:
+  on_gpu_idle: true                 # 出现新的空闲 GPU
+  on_task_queued: true              # 任务入队 / 进入排队模式
+  on_task_started: true             # 任务启动
+  on_task_finished: true            # 任务完成/取消
+  on_task_failed: true              # 任务失败
+  on_error: true                    # 采集失败等异常
+
+  idle_cooldown_seconds: 1800       # 空闲提醒冷却时间，防止来回波动刷屏
+  min_idle_gpus_to_notify: 1        # 至少几张卡空闲才提醒
+
+  mention_all_on_idle: false        # 空闲提醒是否 @所有人
+  mention_all_on_failure: true      # 任务失败是否 @所有人（手机上更容易注意到）
+
+# ---------------------------------------------------------------------------
+# 飞书通知（群机器人 Webhook）
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 飞书（通知 + 交互式查询共用同一个自建应用）—— 凭证请只填在本地 config.yaml（已被 .gitignore 忽略）
+#
+# 为什么不用自定义群机器人 Webhook：它只能「发」不能「收」。接收消息（在飞书里
+# 问 GPU 状态 / 预计结束时间）必须用自建应用 + 长连接（WebSocket），无需公网地址，
+# NAT 后可用。既然查询必须用应用，通知也用同一个应用发，只维护一份凭证。
+#
+# 两个开关**解耦**：
+#   enabled              —— 发送通知（空闲提醒 / 任务起止 / 失败 / 看门狗告警）
+#   interactive_enabled  —— 接收查询（长连接监听；**只读**，无任何写操作）
+#
+# 配置步骤见 README「飞书」一节；只读查询的安全边界（fail-closed 白名单）见 §10。
+# ---------------------------------------------------------------------------
+feishu:
+  # --- 自建应用凭证（开放平台 → 自建应用 → 凭证与基础信息）---
+  app_id: ""
+  app_secret: ""
+
+  # --- 出站通知 ---
+  enabled: true                    # 是否发送通知（与下面的入站开关无关）
+  card: true                       # true = 卡片消息（更好看），false = 纯文本
+  mention_all: false               # 全局默认是否 @所有人（可被 notify.* 覆盖）
+  receive_id_type: open_id         # open_id / user_id / chat_id / email
+  receive_id: ""
+  timeout_seconds: 10
+  verify_ssl: true
+
+  # 出站地址白名单（防 SSRF）：请求只会发往这些主机。
+  # 用自建网关/代理转发时，把它的主机名加到列表里，或设 allow_any_host: true。
+  allowed_hosts:
+    - open.feishu.cn
+    - open.larksuite.com
+  allow_any_host: false
+
+  # --- 入站交互查询（只读；发「状态」「队列」「预计」「日志 <任务>」「帮助」）---
+  interactive_enabled: true        # 长连接开关；关掉只是不再接收查询，通知照发
+  # 允许查询的 open_id 白名单。留空 = 拒绝所有人（fail-closed）：
+  # 先给机器人发一条消息，从 data/manager.log 取你的 open_id 填进来。
+  allowed_users: []
+  rate_limit_per_minute: 10
+  log_lines_default: 20            # 「日志 <任务名>」默认行数
+
+  # --- ETA（预计结束时间）---
+  eta_enabled: true
+  eta_sample_interval_seconds: 60   # 采样进度的间隔
+  eta_history_fallback: true        # 无进度输出时用历史中位耗时
+  eta_history_max_runs: 20
+  eta_patterns: []                  # 自定义正则；空 = 内置（tqdm/Epoch/step）
+
+# ---------------------------------------------------------------------------
+# 任务执行
+# ---------------------------------------------------------------------------
+runner:
+  # 留空自动探测（which conda / ~/anaconda3/bin/conda 等）
+  conda_bin: ""
+  term_grace_seconds: 20            # 取消任务时，SIGTERM 后等多少秒再 SIGKILL
+  kill_after_grace: true            # grace 期后仍未退出则 SIGKILL（只对自己启动的进程组）
+  max_log_mb: 64                    # 单个任务日志文件的 MB 上限（超过则轮转为 .log.1）
+  extra_env: {}                     # 所有任务都会带上的环境变量，例如 {OMP_NUM_THREADS: "8"}
+
+# ---------------------------------------------------------------------------
+# 日志保留与磁盘占用（磁盘空间保护）
+#
+# 两级约束: 先按「每个任务保留最近几次」删，再按 logs/ 总量上限删。
+# 删除以「一次运行的产物」为单位（.log / .log.1 / .run.sh / .exit 一起删），
+# 且**正在运行任务的日志绝不会被删**。0 表示不限制。
+# 手动清理/查看占用: gpu-manager prune [--dry-run] [--usage]
+# ---------------------------------------------------------------------------
+storage:
+  task_log_keep_files_per_task: 10  # 每个任务只留最近 10 次运行的日志
+  task_log_dir_max_mb: 200          # logs/ 总量硬上限；超出按最旧优先删
+  prefer_keep_failed_logs: true     # 超限时先删成功任务的日志，失败任务的留久一点
+
+  daemon_log_max_mb: 5              # daemon 日志（data/manager.log）单文件上限
+  daemon_log_backups: 2             # 保留几个历史文件（.1 / .2）
+  events_max_mb: 5                  # data/events.jsonl 上限（超出只保留尾部）
+  daemon_out_max_mb: 5              # data/manager.out.log 上限（异常堆栈）
+
+  prune_interval_seconds: 300       # daemon 自动清理的检查周期（0 = 不自动清理）
+
+# ---------------------------------------------------------------------------
+# 看门狗（训练任务的「还在推进吗」低频体检）
+#
+# 只在有运行中任务时工作；任务全部结束就自动关闭（零开销），有新任务再自动开启。
+# 三类信号任一有动静就算「有进展」:
+#   1. 进度记录   —— task.progress_updated_at（eta 采样写入新样本的时间）
+#   2. 日志时间   —— 捕获日志 / eta_logs / 进度来源文件的 mtime
+#   3. 进程状态   —— /proc/<pid> 的存活、身份（starttime 防 PID 复用）与状态字符
+#
+# 告警时会把「进程详情 + 日志尾部 + 进度/ETA + 相关 GPU 快照」写到
+# data/diagnostics/<任务>/<时间戳>/，便于事后查原因。
+# 查看: gpu-manager watchdog [status|diagnostics [任务]] [--show]
+#
+# 安全: 全程只读 /proc 与文件，绝不对任何进程发信号、不清显存、不 reset。
+# ---------------------------------------------------------------------------
+watchdog:
+  enabled: true                     # 总开关（false = 完全不检查）
+  check_interval_seconds: 600       # 每 10 分钟检查一轮（低频）
+  stall_threshold_seconds: 3600     # 连续 60 分钟无任何进展 → 告警
+  startup_grace_seconds: 900        # 任务启动后 15 分钟宽限期（编译/加载数据不算停滞）
+  repeat_alert_interval_seconds: 3600  # 持续停滞时每小时重复提醒（0 = 只告警一次）
+  notify_on_recovery: true          # 恢复进展时发一条通知
+
+  instant_process_anomaly: true     # 进程消失/僵尸/停止/D 状态 → 不等阈值，立即告警
+  anomaly_confirm_checks: 2         # 但需连续 2 轮确认（避免瞬时抖动误报）
+
+  log_tail_lines: 200               # 诊断快照里每个日志来源保留的尾部行数
+
+  # 诊断快照保留（独立于 storage，不会干扰 logs/ 的整组清理）
+  diagnostics_enabled: true
+  diagnostics_keep_per_task: 5      # 每个任务最多留 5 份快照
+  diagnostics_max_mb: 50            # 诊断目录总量上限；超出从最旧开始删
+  include_gpu_snapshot: true        # 快照里包含该任务的 GPU 状态与占用进程
+
+# ---------------------------------------------------------------------------
+# 路径（相对本文件所在目录）
+# ---------------------------------------------------------------------------
+paths:
+  state_file: data/state.json       # 权威运行状态
+  log_file: data/manager.log        # daemon 日志
+  event_log: data/events.jsonl      # 事件流（谁在什么时候动了什么）
+  task_log_dir: logs                # 每个任务的 stdout/stderr
+  diagnostics_dir: data/diagnostics  # 看门狗告警时的诊断快照
+  pid_file: data/manager.pid
+  socket_file: data/manager.sock    # CLI ↔ daemon 控制通道
+  queue_file: tasks.yaml            # 任务提交文件（只读导入）
+
+# ---------------------------------------------------------------------------
+# 任务默认值（tasks.yaml 里未写字段时的缺省）
+# ---------------------------------------------------------------------------
+task_defaults:
+  gpu_num: 1
+  priority: 0
+  env: ""                           # 例如 "myenv"
+  min_free_memory_mb: 0             # >0 时要求单卡空闲显存不低于该值
+  max_retries: 0                    # 失败自动重试次数（超时不重试）
+  retry_delay_seconds: 60
+  timeout_seconds: 0                # 0 = 不限制运行时长

@@ -1,0 +1,20 @@
+{
+  "include": ["gpu_manager", "tests"],
+  "exclude": [
+    "**/__pycache__",
+    "**/*.pyc",
+    "data",
+    "logs",
+    ".git"
+  ],
+  "extraPaths": ["."],
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "extraPaths": ["."]
+    }
+  ],
+  "pythonVersion": "3.10",
+  "typeCheckingMode": "basic",
+  "reportMissingTypeStubs": "none"
+}

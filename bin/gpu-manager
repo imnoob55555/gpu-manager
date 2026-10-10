@@ -1,0 +1,28 @@
+#!/bin/sh
+# 无需安装即可使用的启动脚本:
+#   ./bin/gpu-manager status
+# 或者加入 PATH 后全局使用:
+#   export PATH="$HOME/gpu-manager/bin:$PATH"
+#   gpu-manager start
+#
+# 也可以选择正式安装（会生成真正的 gpu-manager 命令）:
+#   cd ~/gpu-manager && pip install -e .
+set -e
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+
+# 选一个带 PyYAML / requests / filelock 的 python。
+# 可用 GPU_MANAGER_PYTHON 覆盖，例如 GPU_MANAGER_PYTHON=/opt/conda/bin/python3
+PY="${GPU_MANAGER_PYTHON:-}"
+if [ -z "$PY" ]; then
+    if [ -x "$HOME/anaconda3/bin/python3" ]; then
+        PY="$HOME/anaconda3/bin/python3"
+    elif [ -x "$HOME/miniconda3/bin/python3" ]; then
+        PY="$HOME/miniconda3/bin/python3"
+    else
+        PY=python3
+    fi
+fi
+
+exec "$PY" -m gpu_manager "$@"

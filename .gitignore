@@ -1,0 +1,25 @@
+# 运行时数据（状态、日志、PID、socket）—— 不要提交
+data/
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# 本地真实配置与任务定义（含凭证 / 私有路径）—— 仓库里只放 *.example.yaml
+config.yaml
+config.yaml.bak-*
+tasks.yaml

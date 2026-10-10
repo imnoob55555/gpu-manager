@@ -1,0 +1,100 @@
+---
+# ============================================================================
+# 任务提交文件
+#
+# 语义说明（重要）:
+#   - 本文件是「提交入口」，daemon 只读不写，所以你手改它永远不会与程序冲突。
+#   - 这里的 status 只是提交指令，取值: pending(默认) / cancelled / disabled
+#       pending   → 入队等待调度
+#       cancelled → 取消该任务（运行中则会优雅停止它的进程组）
+#       disabled  → 忽略该条目（想做「暂时不跑」的开关就用它）
+#   - 任务的权威运行状态（running/completed/failed/cancelled + pid/GPU/时间）
+#     保存在 data/state.json，用 `gpu-manager list` 查看。
+#   - 幂等: 内容没变就不会重复入队；改了内容则视为一次新提交并重新入队。
+#     若该任务正在运行，则不会被打断（需要先 `gpu-manager cancel <name>`）。
+#
+# 字段:
+#   name                  必填，唯一。字母/数字开头，只含字母数字 . _ -（最长 64）
+#   cwd                   必填，绝对路径，纯训练脚本的工作目录
+#   command               必填，实际命令（YAML 的 > 折叠成一行；多行脚本用 | ）
+#   env                   conda 环境名；也可写环境目录绝对路径（如 /opt/envs/myenv）
+#   gpu_num               需要几张 GPU（默认取 config.yaml 的 task_defaults.gpu_num）
+#   priority              优先级，越大越先调度；同优先级按提交顺序 FIFO
+#   min_free_memory_mb    单卡最低空闲显存要求（MiB），0 = 不看显存余量
+#   max_retries           失败后自动重试次数（0 = 不重试；超时不会重试）
+#   retry_delay_seconds   重试等待秒数
+#   timeout_seconds       运行超时秒数，超时会被优雅停止（0 = 不限）
+#   env_vars              附加环境变量（会与 CUDA_VISIBLE_DEVICES 等合并）
+#   notes                 备注，出现在通知里
+#
+# ETA（预计结束时间）相关（可选）。很多训练脚本会把输出重定向到自己的日志，
+# 此时管理器捕获的 stdout 里看不到任何进度，建议声明下面几项：
+#   eta_logs              额外的进度日志文件列表。**相对 cwd，或绝对路径**；
+#                         若日志在 cwd 之外（如实验目录与 cwd 不同层）请用绝对路径
+#   total_epochs          整轮总轮数。用于把「Epoch: [141] [10/63]」换算成整轮进度；
+#                         不填则只报「第几轮」，不会编造结束时间
+#   stage_file            阶段标记文件（如 stage.status，内容 training/evaluating）。
+#                         阶段变化时旧进度会被丢弃，避免跨阶段外推出错；
+#                         同样支持相对 cwd 或绝对路径
+#
+# Manager 会自动注入:
+#   CUDA_VISIBLE_DEVICES=<分配到的卡>   PYTHONUNBUFFERED=1
+#   GPU_MANAGER_TASK / GPU_MANAGER_GPU_IDS /
+#   GPU_MANAGER_SERVER / GPU_MANAGER_LOG
+# ============================================================================
+
+tasks: []
+
+# ---- 示例（把 tasks: [] 换成下面的缩进形式即可）-----------------------------
+#
+# tasks:
+#   # 例 1: 2 卡训练，高优先级，需要每卡至少 30GB 空闲显存
+#   - name: baseline
+#     cwd: /data/project
+#     env: myenv
+#     command: >
+#       python main.py
+#       --config_file configs/baseline.py
+#       --output_dir exps/baseline
+#     gpu_num: 2
+#     priority: 10
+#     min_free_memory_mb: 30000
+#     max_retries: 1
+#     retry_delay_seconds: 120
+#     notes: baseline 复现实验
+#
+#   # 例 2: 单卡小实验，低优先级（有空闲卡就插空跑，不阻塞大任务）
+#   - name: ablation
+#     cwd: /data/project
+#     env: myenv
+#     command: python tools/ablate.py --seed 0
+#     gpu_num: 1
+#     priority: 1
+#     timeout_seconds: 21600      # 6 小时没跑完就停掉，避免占着卡
+#
+#   # 例 3: 用 shell 多行脚本
+#   - name: train_then_eval
+#     cwd: /data/project
+#     env: /opt/envs/myenv       # 也可以直接给环境目录
+#     command: |
+#       set -e
+#       python train.py --epochs 10
+#       python eval.py --ckpt exps/latest.pth
+#     gpu_num: 4
+#     priority: 5
+#     env_vars:
+#       WANDB_MODE: offline
+#       OMP_NUM_THREADS: "8"
+#
+#   # 例 4: 脚本把输出重定向到自己的日志（很常见）—— 需要声明 eta_logs
+#   # 注意: 日志不在 cwd 下时（实验目录与 cwd 不同层）必须用绝对路径
+#   - name: owdetr_g500
+#     cwd: /data3/wh/OW-DETR/exps/exp1/source
+#     env: owdetr
+#     command: bash run.sh
+#     gpu_num: 8
+#     priority: 20
+#     total_epochs: 500
+#     eta_logs:
+#       - /data3/wh/OW-DETR/exps/exp1/console.log
+#     stage_file: /data3/wh/OW-DETR/exps/exp1/stage.status
