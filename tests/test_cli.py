@@ -85,7 +85,7 @@ DOCUMENTED_INVOCATIONS: list[list[str]] = [
     ["watchdog", "status"],
     ["watchdog", "status", "--json"],
     ["watchdog", "diagnostics"],
-    ["watchdog", "diagnostics", "owdetr_x", "--show"],
+    ["watchdog", "diagnostics", "task_x", "--show"],
     ["watchdog", "diagnostics", "--json"],
     # 全局选项写在子命令之前
     ["--config", "config.yaml", "status"],

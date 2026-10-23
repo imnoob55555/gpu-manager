@@ -147,6 +147,11 @@ class BotContext:
     gpu_error: str = ""
     #: 读任务日志尾部（由 daemon 注入，router 自己不碰文件系统）
     log_reader: Callable[[str, int], list[str] | None] | None = None
+    #: 「队列」回复上限（config 的 queue.*；交互查询仍然只读，真正的删除在 daemon）
+    queue_max_unfinished: int = 10
+    queue_max_finished: int = 5
+    #: 已结束任务的时间窗口（秒）；0 = 不按时间过滤（永久保留）
+    finished_window_seconds: float = 72 * 3600.0
 
 
 @dataclass
@@ -310,18 +315,59 @@ class CommandRouter:
         return self._finish(lines)
 
     def render_tasks(self, ctx: BotContext) -> str:
+        """「队列」查询：未完成最多 N 个 + 已结束最多 M 个（时间窗口内）。
+
+        上限与窗口都来自 config 的 ``queue.*``。超窗的终态任务由 daemon 定期
+        **删除记录**；这里再按窗口过滤一次，保证清理间隔内回复也不会变长。
+        """
         if not ctx.tasks:
             return self._finish([f"任务 · {ctx.server}", "", "（队列为空）"])
 
-        order = {"running": 0, "pending": 1, "failed": 2, "cancelled": 3, "completed": 4}
-        tasks = sorted(ctx.tasks, key=lambda t: (order.get(t.status, 9), -t.priority, t.name))
-        lines = [f"任务 · {ctx.server} · {time.strftime('%m-%d %H:%M')}"]
-        for task in tasks[:15]:
-            icon = {"running": "▶", "pending": "◻", "completed": "✔", "failed": "✘", "cancelled": "⊘"}.get(
-                task.status, "?"
-            )
+        terminal = ("completed", "failed", "cancelled")
+        window = max(0.0, float(ctx.finished_window_seconds))
+        cutoff = time.time() - window
+
+        def ended_at(task: TaskView) -> float:
+            return task.finished_at if task.finished_at is not None else 0.0
+
+        running = sorted(
+            (t for t in ctx.tasks if t.status == "running"),
+            key=lambda t: (-t.priority, t.name),
+        )
+        pending = sorted(
+            (t for t in ctx.tasks if t.status == "pending"),
+            key=lambda t: (-t.priority, t.name),
+        )
+        unfinished = running + pending
+
+        # window <= 0 表示「永久保留」，此时不做时间过滤（否则会把所有已结束任务当过期）
+        if window <= 0:
+            finished = [t for t in ctx.tasks if t.status in terminal]
+            expired = 0
+        else:
+            finished = [t for t in ctx.tasks if t.status in terminal and ended_at(t) >= cutoff]
+            expired = sum(1 for t in ctx.tasks if t.status in terminal and ended_at(t) < cutoff)
+        finished.sort(key=ended_at, reverse=True)
+
+        max_unfinished = max(1, int(ctx.queue_max_unfinished))
+        max_finished = max(0, int(ctx.queue_max_finished))
+        shown = unfinished[:max_unfinished] + finished[:max_finished]
+        hidden_unfinished = max(0, len(unfinished) - max_unfinished)
+        hidden_finished = max(0, len(finished) - max_finished)
+
+        hours = int(round(window / 3600))
+        lines = [
+            f"任务 · {ctx.server} · {time.strftime('%m-%d %H:%M')}",
+            f"未完成 {len(unfinished)} 个 · 已结束 {len(finished)} 个"
+            + (f"（最近 {hours} 小时）" if hours else ""),
+        ]
+        rows: list[str] = []
+        for task in shown:
+            icon = {
+                "running": "▶", "pending": "◻", "completed": "✔", "failed": "✘", "cancelled": "⊘",
+            }.get(task.status, "?")
             head = f"{icon} {task.name} [{task.status}]"
-            detail = []
+            detail: list[str] = []
             if task.gpu_ids:
                 detail.append("GPU " + ",".join(str(g) for g in task.gpu_ids))
             elif task.status == "pending":
@@ -338,11 +384,22 @@ class CommandRouter:
                     detail.append(task.waiting_reason)
             elif task.status in ("failed", "cancelled") and task.error:
                 detail.append(truncate(task.error, 60))
-            lines.append(f"{head}  {' · '.join(detail)}")
+            rows.append(f"{head}  {' · '.join(detail)}")
             if task.eta_text and task.status == "running":
-                lines.append(f"    {task.eta_text}")
-        if len(tasks) > 15:
-            lines.append(f"...另有 {len(tasks) - 15} 个任务（用 `gpu-manager list` 看全部）")
+                rows.append(f"    {task.eta_text}")
+
+        if rows:
+            lines += [""] + rows
+
+        notes: list[str] = []
+        if hidden_unfinished:
+            notes.append(f"另有 {hidden_unfinished} 个未完成未列出")
+        if hidden_finished:
+            notes.append(f"另有 {hidden_finished} 个已结束未列出")
+        if expired:
+            notes.append(f"{expired} 个已结束超过 {hours} 小时，将不再保留")
+        if notes:
+            lines += ["", "（" + "；".join(notes) + "）", "完整列表: `gpu-manager list`"]
         return self._finish(lines)
 
     def render_eta(self, ctx: BotContext) -> str:
@@ -749,6 +806,8 @@ class FeishuBot:
             self.logger.error("初始化飞书长连接失败: %s", exc)
             return False
 
+        # pi-lens-ignore: python-thread-global-write -- 长连接线程只读锁内快照（context_provider），
+        # 唯一共享写入是 _stop 标志与审计事件（append_event 内部有文件锁）
         self._thread = threading.Thread(target=self._run, name="gpu-manager-feishu-bot", daemon=True)
         self._thread.start()
         self.logger.info("飞书交互查询已启动（长连接）")

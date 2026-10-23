@@ -556,6 +556,29 @@ class QueueManager:
         task.error = error
         task.stop_requested = False
 
+    def purge_finished(self, *, before: float, protect: Iterable[str] = ()) -> list[str]:
+        """删除结束时间早于 ``before`` 的终态任务记录，返回被删掉的任务名。
+
+        只动终态（completed / failed / cancelled）：pending 与 running 永远不删。
+        ``protect`` 用于跳过调用方仍在引用的任务（例如还挂在停止流程里）。
+        终态但没有 ``finished_at``（旧状态文件）时按 ``created_at`` 兑底判断，
+        宁可多留一会儿也不误删。
+        """
+        protected = set(protect)
+        doomed: list[str] = []
+        for name, task in self.tasks.items():
+            if not task.is_terminal or name in protected:
+                continue
+            ended = task.finished_at if task.finished_at is not None else task.created_at
+            if ended < before:
+                doomed.append(name)
+        for name in doomed:
+            self.tasks.pop(name, None)
+        if doomed:
+            shown = ", ".join(doomed[:8]) + ("…" if len(doomed) > 8 else "")
+            self.logger.info("清理终态任务记录 %d 个: %s", len(doomed), shown)
+        return doomed
+
     # ------------------------------------------------------------------ #
     # 从 tasks.yaml 导入（幂等）
     # ------------------------------------------------------------------ #

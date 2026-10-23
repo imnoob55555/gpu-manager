@@ -88,13 +88,13 @@ tasks: []
 #
 #   # 例 4: 脚本把输出重定向到自己的日志（很常见）—— 需要声明 eta_logs
 #   # 注意: 日志不在 cwd 下时（实验目录与 cwd 不同层）必须用绝对路径
-#   - name: owdetr_g500
-#     cwd: /data3/wh/OW-DETR/exps/exp1/source
-#     env: owdetr
+#   - name: exp500
+#     cwd: /data/project/exps/exp1/source
+#     env: myenv
 #     command: bash run.sh
 #     gpu_num: 8
 #     priority: 20
 #     total_epochs: 500
 #     eta_logs:
-#       - /data3/wh/OW-DETR/exps/exp1/console.log
-#     stage_file: /data3/wh/OW-DETR/exps/exp1/stage.status
+#       - /data/project/exps/exp1/console.log
+#     stage_file: /data/project/exps/exp1/stage.status

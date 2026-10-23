@@ -17,6 +17,7 @@ import importlib.util
 import json
 import logging
 import secrets
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -98,7 +99,10 @@ def make_context(**kw) -> BotContext:
                 name="exp2", status="pending", gpu_num=2, priority=5,
                 wait_seconds=720, waiting_reason="需要 2 张确认空闲卡，当前可用 0",
             ),
-            TaskView(name="old", status="failed", gpu_ids=[3], error="退出码 1"),
+            TaskView(
+                name="old", status="failed", gpu_ids=[3], error="退出码 1",
+                finished_at=time.time(),
+            ),
         ],
         daemon_pid=999,
         uptime_seconds=3600,
@@ -238,10 +242,88 @@ def test_render_tasks_empty_queue():
     assert "队列为空" in text
 
 
-def test_render_tasks_caps_long_list():
-    tasks = [TaskView(name=f"t{i}", status="pending", gpu_num=1) for i in range(20)]
+def test_render_tasks_caps_unfinished_and_finished():
+    """新规则：未完成最多 10 个、已结束最多 5 个（含 cancelled），超出只给汇总。"""
+    now = time.time()
+    unfinished = [TaskView(name=f"p{i:02d}", status="pending", gpu_num=1) for i in range(14)]
+    finished = [
+        TaskView(name=f"f{i:02d}", status="completed", finished_at=now - i * 60)
+        for i in range(8)
+    ]
+    text = CommandRouter().handle("队列", make_context(tasks=unfinished + finished))
+
+    for i in range(10):
+        assert f"p{i:02d}" in text, f"前 10 个未完成任务都应列出（缺 p{i:02d}）"
+    assert "p10" not in text, "第 11 个未完成任务不应列出"
+    for i in range(5):
+        assert f"f{i:02d}" in text, f"最新 5 个已结束任务都应列出（缺 f{i:02d}）"
+    assert "f05" not in text, "更早的已结束任务不应列出"
+    assert "未完成 14 个 · 已结束 8 个" in text
+    assert "另有 4 个未完成未列出" in text
+    assert "另有 3 个已结束未列出" in text
+    assert '完整列表: `gpu-manager list`' in text
+
+
+def test_render_tasks_hides_records_outside_window():
+    """超过时间窗口（默认 72h）的已结束记录不返回（daemon 会真正删掉它们）。"""
+    now = time.time()
+    ctx = make_context(
+        tasks=[
+            TaskView(name="fresh", status="completed", finished_at=now - 60),
+            TaskView(
+                name="expired", status="failed", finished_at=now - 80 * 3600, error="退出码 1"
+            ),
+        ]
+    )
+    text = CommandRouter().handle("队列", ctx)
+
+    assert "fresh" in text
+    assert "expired" not in text
+    assert "1 个已结束超过 72 小时" in text
+
+
+def test_render_tasks_counts_cancelled_in_finished_bucket():
+    """cancelled 与 completed/failed 共用那 5 个名额。"""
+    now = time.time()
+    tasks = [
+        TaskView(name=f"c{i}", status="cancelled", finished_at=now - i * 60) for i in range(6)
+    ]
     text = CommandRouter().handle("队列", make_context(tasks=tasks))
-    assert "另有 5 个任务" in text
+
+    assert "已结束 6 个" in text
+    assert "c0" in text and "c4" in text
+    assert "c5" not in text
+    assert "另有 1 个已结束未列出" in text
+
+
+def test_render_tasks_retention_zero_keeps_every_finished_record():
+    """finished_window_seconds=0 表示永久保留：不按时间过滤（只受条数上限）。"""
+    ctx = make_context(
+        tasks=[
+            TaskView(
+                name="ancient", status="completed", finished_at=time.time() - 400 * 24 * 3600
+            )
+        ],
+        finished_window_seconds=0.0,
+    )
+    assert "ancient" in CommandRouter().handle("队列", ctx)
+
+
+def test_render_tasks_keeps_finished_newest_first():
+    now = time.time()
+    ctx = make_context(
+        tasks=[
+            TaskView(name="older", status="completed", finished_at=now - 7200),
+            TaskView(name="newer", status="completed", finished_at=now - 60),
+        ]
+    )
+    text = CommandRouter().handle("队列", ctx)
+    assert text.index("newer") < text.index("older")
+
+
+def test_render_tasks_within_limits_has_no_overflow_note():
+    text = CommandRouter().handle("队列", make_context())
+    assert "另有" not in text and "完整列表" not in text
 
 
 def test_render_eta_per_gpu_free_time():

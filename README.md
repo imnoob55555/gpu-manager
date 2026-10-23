@@ -197,6 +197,9 @@ gpu:
 - 清理以「一次运行的产物」为单位：`.log` / `.log.1` / `.run.sh` / `.exit` 一起删，
   不会留下孤立的 run.sh
 - **正在运行任务的日志绝不会被删**
+- **已结束任务的记录**（state.json 里的 completed/failed/cancelled）保留
+  `queue.finished_retention_hours`（默认 72 小时），超时由 daemon 自动删除；
+  删除后 `gpu-manager list/show` 也查不到（日志文件另受上面的上限约束）
 - 总量超限时**先删成功任务的日志**，失败任务的留久一点
   （`prefer_keep_failed_logs: true`）
 - daemon 每 `storage.prune_interval_seconds`（默认 300 秒）自动检查一次；
@@ -250,7 +253,7 @@ gpu-manager watchdog diagnostics exp1 --show   # 打印某任务最新一份摘�
 | 你发 | 回复 |
 | --- | --- |
 | `状态` | 每张卡的 util/显存/占用者/可调度性 + 当前模式 |
-| `队列` | 任务列表（进度、预计结束、等待原因） |
+| `队列` | 任务列表：最多 10 个未完成 + 5 个已结束（72 小时内），含进度/预计/等待原因 |
 | `预计` | 运行中任务的预计结束 + 各卡预计空出时间 |
 | `日志 <任务名> [行数]` | 该任务日志尾部（默认 20 行） |
 | `帮助` | 命令表 |

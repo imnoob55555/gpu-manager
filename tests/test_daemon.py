@@ -808,3 +808,53 @@ def test_watchdog_recovers_when_task_finishes(cfg, workdir):
 
     assert d.watchdog.watches == {}
     assert d.watchdog.active is False
+
+
+# --------------------------------------------------------------------------- #
+# 终态任务记录清理（queue.finished_retention_hours）
+# --------------------------------------------------------------------------- #
+def test_purge_finished_records_disabled_when_retention_zero(cfg):
+    cfg.queue.finished_retention_hours = 0
+    d = Daemon(cfg)
+    task = d.queue.add(make_spec("t1"))
+    d.queue.mark_finished(task, status=COMPLETED, exit_code=0)
+    task.finished_at = time.time() - 400 * 3600
+
+    d._maybe_purge_finished(time.time())
+
+    assert d.queue.get("t1") is not None, "保留时长为 0（永久保留）时不得删除"
+
+
+def test_purge_finished_records_removes_expired_and_emits_event(cfg):
+    cfg.queue.finished_retention_hours = 72
+    d = Daemon(cfg)
+    task = d.queue.add(make_spec("gone"))
+    d.queue.mark_finished(task, status=COMPLETED, exit_code=0)
+    task.finished_at = time.time() - 100 * 3600
+    fresh = d.queue.add(make_spec("keep"))
+    d.queue.mark_finished(fresh, status=FAILED, exit_code=1)
+
+    d._maybe_purge_finished(time.time())
+
+    assert d.queue.get("gone") is None, "超过窗口的终态记录应被真正删除"
+    assert d.queue.get("keep") is not None
+    events = StateStore.read_events(cfg.event_log, 20)
+    assert any(
+        e.get("event") == "purge_finished" and "gone" in (e.get("removed") or []) for e in events
+    ), "删除要留下事件流记录（可追溯）"
+
+
+def test_purge_finished_records_is_throttled(cfg):
+    cfg.queue.finished_retention_hours = 72
+    d = Daemon(cfg)
+    now = time.time()
+    d._maybe_purge_finished(now)  # 首次跑一轮（队列为空）
+    task = d.queue.add(make_spec("later"))
+    d.queue.mark_finished(task, status=FAILED, exit_code=1)
+    task.finished_at = now - 100 * 3600
+
+    d._maybe_purge_finished(now + 1)  # 未到周期 → 不清理
+    assert d.queue.get("later") is not None
+
+    d._maybe_purge_finished(now + daemon_mod.FINISHED_PURGE_INTERVAL + 1)
+    assert d.queue.get("later") is None

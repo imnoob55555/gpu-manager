@@ -342,3 +342,45 @@ def test_watchdog_unknown_key_rejected(tmp_path):
     path = write(tmp_path, base(watchdog={"stall_threshold_second": 900}))
     with pytest.raises(ConfigError, match="watchdog 段存在未知字段"):
         load_config(path)
+
+
+# --------------------------------------------------------------------------- #
+# 任务列表展示上限与终态记录保留（queue 段）
+# --------------------------------------------------------------------------- #
+def test_queue_defaults(tmp_path):
+    cfg = load_config(write(tmp_path, base()))
+    assert cfg.queue.max_unfinished_in_reply == 10
+    assert cfg.queue.max_finished_in_reply == 5
+    assert cfg.queue.finished_retention_hours == 72
+
+
+def test_queue_overrides_parsed(tmp_path):
+    cfg = load_config(
+        write(
+            tmp_path,
+            base(
+                queue={
+                    "max_unfinished_in_reply": 3,
+                    "max_finished_in_reply": 0,
+                    "finished_retention_hours": 24,
+                }
+            ),
+        )
+    )
+    assert cfg.queue.max_unfinished_in_reply == 3
+    assert cfg.queue.max_finished_in_reply == 0, "0 表示回复里不列已结束任务"
+    assert cfg.queue.finished_retention_hours == 24
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("max_unfinished_in_reply", 0),
+        ("max_finished_in_reply", -1),
+        ("finished_retention_hours", -1),
+    ],
+)
+def test_queue_invalid_values_rejected(tmp_path, key, value):
+    path = write(tmp_path, base(queue={key: value}))
+    with pytest.raises(ConfigError, match=key):
+        load_config(path)

@@ -202,6 +202,42 @@ class NotifyConfig:
 
 
 @dataclass
+class QueueConfig:
+    """任务列表的**展示上限**与终态任务**记录保留**。
+
+    两个概念要分清:
+      · ``max_*_in_reply`` —— 只影响飞书「队列」回复的长度（交互查询仍然只读）
+      · ``finished_retention_hours`` —— 超时的终态（completed/failed/cancelled）任务
+        记录由 daemon **真正删除**（state.json 里不再有它，`list`/`show` 也查不到）；
+        日志文件另有 ``storage`` 策略单独保留。0 = 永久保留记录。
+    """
+
+    #: 「队列」回复最多列多少个未完成任务（running 在前，pending 按优先级）
+    max_unfinished_in_reply: int = 10
+    #: 「队列」回复最多列多少个已结束任务（按结束时间倒序；cancelled 也计入，0 = 不列）
+    max_finished_in_reply: int = 5
+    #: 已结束任务记录的保留小时数；超时由 daemon 自动删除（0 = 永久保留）
+    finished_retention_hours: int = 72
+
+    def validate(self) -> None:
+        if self.max_unfinished_in_reply < 1:
+            raise ConfigError(
+                "queue.max_unfinished_in_reply 必须 >= 1，"
+                f"实际是 {self.max_unfinished_in_reply}"
+            )
+        if self.max_finished_in_reply < 0:
+            raise ConfigError(
+                "queue.max_finished_in_reply 必须 >= 0，"
+                f"实际是 {self.max_finished_in_reply}"
+            )
+        if self.finished_retention_hours < 0:
+            raise ConfigError(
+                "queue.finished_retention_hours 必须 >= 0，"
+                f"实际是 {self.finished_retention_hours}"
+            )
+
+
+@dataclass
 class FeishuConfig:
     """飞书集成（**唯一**一段）：出站通知与入站交互查询共用同一个自建应用。
 
@@ -450,6 +486,7 @@ class Config:
     gpu: GpuConfig = field(default_factory=GpuConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     notify: NotifyConfig = field(default_factory=NotifyConfig)
+    queue: QueueConfig = field(default_factory=QueueConfig)
     feishu: FeishuConfig = field(default_factory=FeishuConfig)
     runner: RunnerConfig = field(default_factory=RunnerConfig)
     paths: PathsConfig = field(default_factory=PathsConfig)
@@ -524,7 +561,7 @@ class Config:
 # --------------------------------------------------------------------------- #
 def _build(raw: dict[str, Any], base_dir: Path, source: Path | None) -> Config:
     known = {
-        "server", "gpu", "scheduler", "notify", "feishu", "runner", "paths",
+        "server", "gpu", "scheduler", "notify", "queue", "feishu", "runner", "paths",
         "storage", "task_defaults", "tasks", "watchdog",
     }
     if "interactive" in raw:
@@ -594,6 +631,21 @@ def _build(raw: dict[str, Any], base_dir: Path, source: Path | None) -> Config:
     no.min_idle_gpus_to_notify = _get_int(sec, "min_idle_gpus_to_notify", no.min_idle_gpus_to_notify, "notify", minimum=1)
     no.failure_cooldown_seconds = _get_int(sec, "failure_cooldown_seconds", no.failure_cooldown_seconds, "notify", minimum=0)
     cfg.notify = no
+
+    # ---- queue（任务列表展示上限 + 终态记录保留）----
+    sec = _require_mapping(raw.get("queue"), "queue")
+    qu = QueueConfig()
+    qu.max_unfinished_in_reply = _get_int(
+        sec, "max_unfinished_in_reply", qu.max_unfinished_in_reply, "queue", minimum=1
+    )
+    qu.max_finished_in_reply = _get_int(
+        sec, "max_finished_in_reply", qu.max_finished_in_reply, "queue", minimum=0
+    )
+    qu.finished_retention_hours = _get_int(
+        sec, "finished_retention_hours", qu.finished_retention_hours, "queue", minimum=0
+    )
+    qu.validate()
+    cfg.queue = qu
 
     # ---- feishu ----
     sec = _require_mapping(raw.get("feishu"), "feishu")

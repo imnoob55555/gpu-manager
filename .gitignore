@@ -23,3 +23,7 @@ dist/
 config.yaml
 config.yaml.bak-*
 tasks.yaml
+
+# 任何本地备份文件（含真实任务定义/凭证的历史副本）
+*.bak
+*.bak.*

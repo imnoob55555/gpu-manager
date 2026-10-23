@@ -31,7 +31,7 @@ from typing import Any
 #: 所有量词都写**上界**（如 ``\d{1,10}``、``[^|]{0,200}``）而不是 ``+``/``*``：
 #: 日志行可能有几万字符（进度条刷屏），无界量词在匹配失败时会回退爆炸。
 DEFAULT_PATTERNS: tuple[str, ...] = (
-    # DETR/OW-DETR 风格: Epoch: [141]  [10/63]  eta: 0:00:53 ...
+    # DETR 系: Epoch: [141]  [10/63]  eta: 0:00:53 ...
     # 注意行内的 eta 是「本 epoch 剩余」，整轮进度需要 total_epochs 参与换算
     r"(?i)\bepoch\s{0,4}:\s{0,4}\[(?P<done>\d{1,6})\]\s{0,4}"
     r"\[\s{0,4}(?P<sub_done>\d{1,6})\s{0,4}/\s{0,4}(?P<sub_total>\d{1,6})",

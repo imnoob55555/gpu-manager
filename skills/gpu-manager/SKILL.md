@@ -120,7 +120,8 @@ gpu-manager prune             # 立即清理
 ## 通知与飞书
 
 - 推送：空闲提醒、任务启动/完成/失败、看门狗告警（`config.yaml` 的 `notify` / `feishu`）
-- 交互查询（**只读**，白名单 fail-closed）：发「状态」「队列」「预计」「日志 <任务> [行数]」「帮助」
+- 交互查询（**只读**，白名单 fail-closed）：发「状态」「队列」「预计」「日志 <任务> [行数]」「帮助」；「队列」最多回 10 个未完成 + 5 个已结束（72h 内），
+  超窗的已结束记录会被 daemon 删除（`queue.finished_retention_hours`）
 - 没收到提醒先查：`gpu-manager doctor`；再看 `gpu-manager logs -n 50 | grep -E "通知|未授权"`
 
 ## 排错（都是踩过的坑）

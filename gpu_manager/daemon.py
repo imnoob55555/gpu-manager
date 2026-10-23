@@ -100,6 +100,9 @@ TERMINAL_STYLE: dict[str, tuple[str, str, str]] = {
 
 WAITING_LOG_INTERVAL = 600.0  # 等待原因最多每 10 分钟刷一条 INFO，避免日志噪声
 
+#: 终态任务记录清理的检查周期（真正的删除阈值是 ``queue.finished_retention_hours``）
+FINISHED_PURGE_INTERVAL = 600.0
+
 #: 进度采样时回扫的日志行数（tqdm/Epoch 行都在文件末尾）
 PROGRESS_SCAN_LINES = 200
 
@@ -163,6 +166,7 @@ class Daemon:
         self._queue_import_errors_notified = 0.0
         self._last_prune = 0.0
         self._last_progress_sample = 0.0
+        self._last_finished_purge = 0.0
         self.bot: FeishuBot | None = None
         self.server: ControlServer | None = None
 
@@ -412,10 +416,11 @@ class Daemon:
                 if handle.rotate_if_needed(self.cfg.runner.max_log_mb):
                     self.logger.info("任务 %s 日志已轮转（超过 %sMB）", handle.task_name, self.cfg.runner.max_log_mb)
 
-            # 9) 周期性维护: 进度采样（供 ETA）+ 看门狗 + 日志清理（节流）
+            # 9) 周期性维护: 进度采样（供 ETA）+ 看门狗 + 日志清理 + 终态记录清理（节流）
             self._sample_progress(now)
             self._run_watchdog(now)
             self._maybe_prune(now)
+            self._maybe_purge_finished(now)
 
             # 10) 持久化
             self._persist(now)
@@ -1255,6 +1260,10 @@ class Daemon:
                 uptime_seconds=max(0.0, now - self.started_at),
                 gpu_error=snapshot.error,
                 log_reader=self._bot_log_tail,
+                # 回复上限与终态时间窗口（真正删除由 _maybe_purge_finished 负责）
+                queue_max_unfinished=cfg.queue.max_unfinished_in_reply,
+                queue_max_finished=cfg.queue.max_finished_in_reply,
+                finished_window_seconds=float(cfg.queue.finished_retention_hours) * 3600.0,
             )
 
     def _bot_audit(self, record: dict[str, Any]) -> None:
@@ -1317,6 +1326,38 @@ class Daemon:
             with contextlib.suppress(Exception):
                 self.bot.stop()
             self.bot = None
+
+    def _maybe_purge_finished(self, now: float) -> None:
+        """按 ``queue.finished_retention_hours`` 删除过期的终态任务记录。
+
+        为什么放在 daemon 而不是交互查询里：飞书查询是**只读**的（这条不变量有测试锁定），
+        删除只能由主循环做。移除后 `gpu-manager list/show` 也看不到这些记录；
+        任务日志与事件流另有各自的保留策略。
+        """
+        hours = int(self.cfg.queue.finished_retention_hours)
+        if hours <= 0:
+            return
+        if now - self._last_finished_purge < FINISHED_PURGE_INTERVAL:
+            return
+        self._last_finished_purge = now
+        cutoff = now - hours * 3600
+        # 仍在停止流程里的任务即使已是终态也不删（避免状态机引用到已删除对象）
+        protected = set(self._stop_deadlines) | set(self._stop_sent) | set(self._stop_notified)
+        removed = self.queue.purge_finished(before=cutoff, protect=protected)
+        if removed:
+            self.logger.info(
+                "终态任务记录已过期（>%sh），删除 %d 个: %s",
+                hours, len(removed), ", ".join(removed[:8]),
+            )
+            self.store.append_event(
+                {
+                    "event": "purge_finished",
+                    "removed": removed,
+                    "retention_hours": hours,
+                    "cutoff": fmt_ts(cutoff),
+                },
+                self.cfg.event_log,
+            )
 
     def _maybe_prune(self, now: float) -> None:
         """按 storage 配置清理日志，保护磁盘。

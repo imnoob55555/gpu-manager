@@ -412,3 +412,57 @@ def test_load_skips_corrupt_entries(cfg):
     qm.load({"tasks": [{"name": "ok", "cwd": "/x", "command": "c"}, {"nope": 1}, "junk"], "next_seq": 5})
     assert list(qm.tasks) == ["ok"]
     assert qm.next_seq == 5
+
+
+# --------------------------------------------------------------------------- #
+# 终态记录清理（queue.finished_retention_hours）
+# --------------------------------------------------------------------------- #
+def test_purge_finished_removes_only_expired_terminal_tasks(cfg):
+    """只删超窗的终态记录；pending/running 与未超窗的终态都必须留下。"""
+    qm = make_qm(cfg)
+    now = 1_700_000_000.0
+    old_done = qm.add(spec(name="old_done"))
+    qm.mark_finished(old_done, status=COMPLETED, exit_code=0)
+    old_done.finished_at = now - 100 * 3600
+    old_cancelled = qm.add(spec(name="old_cancelled"))
+    qm.mark_finished(old_cancelled, status=CANCELLED, exit_code=None)
+    old_cancelled.finished_at = now - 90 * 3600
+    recent = qm.add(spec(name="recent_done"))
+    qm.mark_finished(recent, status=FAILED, exit_code=1, error="boom")
+    recent.finished_at = now - 3600
+    pending = qm.add(spec(name="still_pending"))
+    running = qm.add(spec(name="still_running"))
+    qm.mark_running(running, gpu_ids=[0], pid=1, pgid=1, proc_start_time=None, log_file="")
+
+    removed = qm.purge_finished(before=now - 72 * 3600)
+
+    assert sorted(removed) == ["old_cancelled", "old_done"]
+    assert qm.get("old_done") is None and qm.get("old_cancelled") is None
+    assert qm.get("recent_done") is not None
+    assert qm.get("still_pending") is not None and qm.get("still_running") is not None
+    assert pending.name in qm.tasks
+
+
+def test_purge_finished_respects_protect_list(cfg):
+    """调用方仍在引用的任务即使超窗也不删（避免状态机引用已删除对象）。"""
+    qm = make_qm(cfg)
+    now = 1_700_000_000.0
+    task = qm.add(spec(name="stopping"))
+    qm.mark_finished(task, status=CANCELLED, exit_code=None)
+    task.finished_at = now - 100 * 3600
+
+    assert qm.purge_finished(before=now - 72 * 3600, protect=["stopping"]) == []
+    assert qm.get("stopping") is not None
+
+
+def test_purge_finished_falls_back_to_created_at(cfg):
+    """旧状态文件里终态任务可能没有 finished_at → 用 created_at 兜底判断。"""
+    qm = make_qm(cfg)
+    now = 1_700_000_000.0
+    task = qm.add(spec(name="legacy"))
+    qm.mark_finished(task, status=COMPLETED, exit_code=0)
+    task.finished_at = None
+    task.created_at = now - 200 * 3600
+
+    assert qm.purge_finished(before=now - 72 * 3600) == ["legacy"]
+    assert qm.get("legacy") is None
