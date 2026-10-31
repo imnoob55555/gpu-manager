@@ -67,6 +67,7 @@ notify:
   on_task_finished: true            # 任务完成/取消
   on_task_failed: true              # 任务失败
   on_error: true                    # 采集失败等异常
+  on_pause: true                    # 暂停/恢复调度时发通知
 
   idle_cooldown_seconds: 1800       # 空闲提醒冷却时间，防止来回波动刷屏
   min_idle_gpus_to_notify: 1        # 至少几张卡空闲才提醒
@@ -81,11 +82,15 @@ notify:
 # 保留时长则由 daemon **真正删除** state.json 里过期的已结束任务记录
 # （completed / failed / cancelled）；删除后 `gpu-manager list/show` 也查不到，
 # 任务日志另有 storage 策略单独保留。0 = 永久保留记录。
+#
+# 注意：删除记录不会导致重跑。daemon 会给删掉的记录留一条「墓碑」（name + 内容指纹），
+# 所以 tasks.yaml 里那条没写 status 的旧条目不会被当成新提交再跑一遍。
 # ---------------------------------------------------------------------------
 queue:
   max_unfinished_in_reply: 10       # 回复里最多列 10 个未完成任务（running 在前）
   max_finished_in_reply: 5          # 最多列 5 个已结束任务（按结束时间倒序，含 cancelled）
   finished_retention_hours: 72      # 已结束记录保留 72 小时；超时由 daemon 删除（0=永久）
+  archive_max_entries: 500          # 墓碑最多记 500 个指纹；超出删最老的（0=不限制）
 
 # ---------------------------------------------------------------------------
 # 飞书（通知 + 交互式查询共用同一个自建应用）—— 凭证请只填在本地 config.yaml（已被 .gitignore 忽略）

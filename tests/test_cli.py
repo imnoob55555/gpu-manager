@@ -389,3 +389,11 @@ def test_watchdog_diagnostics_empty_and_listed(cfg_path, capsys):
     )
     assert cli.cmd_watchdog(args) == 0  # noqa: SLF001
     assert "没有诊断快照" in capsys.readouterr().out
+
+
+def test_pause_resume_require_online_daemon(cfg_path):
+    """暂停/恢复依赖 daemon 主循环应用，离线时必须明确失败而不是假装成功。"""
+    for cmd in ("pause", "resume"):
+        result = _run_cli(cfg_path, cmd)
+        assert result.returncode == 1, f"{cmd} 在 daemon 离线时不应返回 0"
+        assert "daemon 未在运行" in (result.stdout + result.stderr)

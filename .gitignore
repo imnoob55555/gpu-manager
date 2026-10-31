@@ -27,3 +27,7 @@ tasks.yaml
 # 任何本地备份文件（含真实任务定义/凭证的历史副本）
 *.bak
 *.bak.*
+
+# 任何 tasks.yaml / config.yaml 的本地变体（备份、safe 副本等）
+tasks.yaml.*
+config.yaml.*

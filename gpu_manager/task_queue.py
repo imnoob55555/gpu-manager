@@ -48,6 +48,12 @@ SIGNATURE_FIELDS = (
     "min_free_memory_mb", "max_retries", "timeout_seconds",
 )
 
+#: 只影响排队顺序/展示、不影响「算出什么结果」的字段。已结束任务如果只有这些变了，
+#: 不该被当成新提交重新训练（否则改一下 priority 就会重跑一个 100 epoch 的实验）。
+COSMETIC_SIGNATURE_FIELDS = ("priority",)
+#: 「同一个实验」指纹（完整指纹去掉 COSMETIC_SIGNATURE_FIELDS）。
+IDENTITY_SIGNATURE_FIELDS = tuple(f for f in SIGNATURE_FIELDS if f not in COSMETIC_SIGNATURE_FIELDS)
+
 
 class TaskError(ValueError):
     """任务定义错误。"""
@@ -90,6 +96,9 @@ class Task:
     stop_requested: bool = False
     stop_requested_at: float = 0.0
     stop_reason: str = ""
+    #: 因「暂停调度」而停掉的任务：进程退出后**重新排队**，不判失败、不消耗重试次数。
+    #: 持久化在 state.json 里，daemon 重启后也能把这次暂停走完。
+    pause_requested: bool = False
     retry_not_before: float = 0.0
     notify_wait_at: float = 0.0
     #: ETA 用的进度采样，按「阶段」分组: {阶段键: [样本, ...]}
@@ -148,7 +157,17 @@ class Task:
 
     def compute_signature(self) -> str:
         """内容指纹，用于判断 tasks.yaml 中的提交是否发生变化（非安全用途，用 sha256）。"""
-        payload = {k: getattr(self, k) for k in SIGNATURE_FIELDS}
+        return self._signature(SIGNATURE_FIELDS)
+
+    def identity_signature(self) -> str:
+        """「同一个实验」指纹：忽略 priority 这类只影响排队顺序的字段。
+
+        已结束任务用它区分两件事: 内容真的变了（要重跑）vs 只改了优先级/备注（不该重跑）。
+        """
+        return self._signature(IDENTITY_SIGNATURE_FIELDS)
+
+    def _signature(self, fields: tuple[str, ...]) -> str:
+        payload = {k: getattr(self, k) for k in fields}
         raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -185,6 +204,7 @@ class Task:
             "stop_requested": self.stop_requested,
             "stop_requested_at": self.stop_requested_at,
             "stop_reason": self.stop_reason,
+            "pause_requested": self.pause_requested,
             "retry_not_before": self.retry_not_before,
             "notify_wait_at": self.notify_wait_at,
             "progress": dict(self.progress),
@@ -361,6 +381,8 @@ class ImportResult:
     skipped: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     replaced_running: list[str] = field(default_factory=list)
+    #: 已经跑完、这次被墓碑挡下来没有重跑的任务
+    archived: list[str] = field(default_factory=list)
 
     @property
     def changed(self) -> bool:
@@ -376,6 +398,8 @@ class ImportResult:
             parts.append(f"按文件取消 {len(self.cancelled)}: {', '.join(self.cancelled)}")
         if self.replaced_running:
             parts.append(f"运行中拒绝替换 {len(self.replaced_running)}: {', '.join(self.replaced_running)}")
+        if self.archived:
+            parts.append(f"已跑完不重跑 {len(self.archived)}: {', '.join(self.archived)}")
         if self.errors:
             parts.append(f"错误 {len(self.errors)}: {'; '.join(self.errors)}")
         if self.skipped:
@@ -392,6 +416,12 @@ class QueueManager:
         self.logger = logger
         self.tasks: dict[str, Task] = {}
         self.next_seq: int = 1
+        #: 已结束任务的「墓碑」: name → {identity, signature, status, finished_at, archived_at}。
+        #: 记录被 ``queue.finished_retention_hours`` 删掉之后仍然记得它跑过，
+        #: 避免 tasks.yaml 里那条没加 status 的旧条目被当成新提交又跑一遍。
+        self.finished: dict[str, dict[str, Any]] = {}
+        #: 已经解释过的墓碑命中（每个任务只提示一次，避免每 30 秒刷一遍日志）
+        self._archived_logged: set[str] = set()
 
     # ------------------------------------------------------------------ #
     # 序列化
@@ -399,6 +429,12 @@ class QueueManager:
     def load(self, state: dict[str, Any]) -> None:
         self.tasks = {}
         self.next_seq = int(state.get("next_seq", 1) or 1)
+        raw_finished = state.get("finished")
+        self.finished = (
+            {str(name): dict(rec) for name, rec in raw_finished.items() if isinstance(rec, dict)}
+            if isinstance(raw_finished, dict)
+            else {}
+        )
         raw_tasks = state.get("tasks") or []
         if not isinstance(raw_tasks, list):
             self.logger.error("state.tasks 不是列表，忽略（状态可能已损坏）")
@@ -417,6 +453,7 @@ class QueueManager:
     def dump(self, state: dict[str, Any]) -> None:
         state["tasks"] = [t.to_dict() for t in self.ordered_tasks()]
         state["next_seq"] = self.next_seq
+        state["finished"] = self.finished
 
     # ------------------------------------------------------------------ #
     # 查询
@@ -481,6 +518,7 @@ class QueueManager:
                 raise TaskError(f"任务已存在: {task.name}（当前状态 {existing.status}）")
         task.seq = self._take_seq()
         task.status = PENDING
+        self.finished.pop(task.name, None)
         self.tasks[task.name] = task
         return task
 
@@ -491,6 +529,8 @@ class QueueManager:
             raise TaskError(f"任务已是终态，无需取消: {name} (status={task.status})")
         if task.is_running:
             task.stop_requested = True
+            task.pause_requested = False  # 用户改主意取消 → 不再走「暂停后重排队」
+            task.stop_reason = "cancel"
             self.logger.info("任务 %s 已标记停止请求（daemon 将优雅终止其进程组）", name)
         else:
             task.status = CANCELLED
@@ -499,17 +539,32 @@ class QueueManager:
             self.logger.info("任务 %s 已取消（尚未运行）", name)
         return task
 
-    def remove(self, name: str) -> Task:
-        task = self.require(name)
-        if task.is_running:
-            raise TaskError(f"任务正在运行，不能删除: {name}（先 cancel 等它结束）")
-        del self.tasks[name]
-        return task
+    def request_pause(self) -> list[str]:
+        """暂停调度：给所有运行中任务标记「停止后重排队」，返回被标记的任务名。
 
-    def requeue(self, name: str) -> Task:
-        task = self.require(name)
-        if task.is_running:
-            raise TaskError(f"任务正在运行，不能重新入队: {name}")
+        这里**不发信号**：真正的 SIGTERM 由 daemon 的停止流程按统一节奏发（含 grace），
+        这样暂停与取消走同一条经过安全校验的路径。
+        """
+        marked: list[str] = []
+        now = time.time()
+        for task in self.running_tasks():
+            task.stop_requested = True
+            task.stop_requested_at = now
+            task.stop_reason = "pause"
+            task.pause_requested = True
+            marked.append(task.name)
+            self.logger.info("任务 %s 已标记停止请求（暂停调度，结束后重新排队）", task.name)
+        return marked
+
+    def requeue_after_pause(self, task: Task) -> None:
+        """把因暂停被停掉的任务放回队列。
+
+        与用户显式 `requeue` 的区别:
+          · 保留 `seq`（不插队）与 `created_at`（等待时长仍按原提交时间算）
+          · 保留 `retries`（暂停不是任务的错，不消耗重试次数）
+          · 清理进度样本/阶段：重跑从第 0 轮开始，旧样本外推会得出错误 ETA
+        """
+        self.finished.pop(task.name, None)
         task.status = PENDING
         task.gpu_ids = []
         task.pid = None
@@ -520,6 +575,45 @@ class QueueManager:
         task.started_at = None
         task.finished_at = None
         task.stop_requested = False
+        task.stop_requested_at = 0.0
+        task.stop_reason = ""
+        task.pause_requested = False
+        task.retry_not_before = 0.0
+        task.notify_wait_at = 0.0
+        task.log_file = ""
+        task.progress = {}
+        task.progress_updated_at = 0.0
+        task.progress_source = ""
+        task.progress_source_sig = ""
+        task.stage = ""
+
+    def remove(self, name: str) -> Task:
+        task = self.require(name)
+        if task.is_running:
+            raise TaskError(f"任务正在运行，不能删除: {name}（先 cancel 等它结束）")
+        if task.is_terminal:
+            # 记录从 state 删了，但 tasks.yaml 里可能还留着同一条 → 记墓碑，别让它复活
+            self._remember_finished(task)
+        del self.tasks[name]
+        return task
+
+    def requeue(self, name: str) -> Task:
+        task = self.require(name)
+        if task.is_running:
+            raise TaskError(f"任务正在运行，不能重新入队: {name}")
+        # 用户显式要求重跑 → 清掉墓碑（否则下次 retention 清理又会把它当成已跑完）
+        self.finished.pop(name, None)
+        task.status = PENDING
+        task.gpu_ids = []
+        task.pid = None
+        task.pgid = None
+        task.proc_start_time = None
+        task.exit_code = None
+        task.error = ""
+        task.started_at = None
+        task.finished_at = None
+        task.stop_requested = False
+        task.pause_requested = False
         task.retry_not_before = 0.0
         task.created_at = time.time()
         task.notify_wait_at = 0.0
@@ -573,11 +667,33 @@ class QueueManager:
             if ended < before:
                 doomed.append(name)
         for name in doomed:
-            self.tasks.pop(name, None)
+            task = self.tasks.pop(name, None)
+            if task is not None:
+                self._remember_finished(task)
         if doomed:
             shown = ", ".join(doomed[:8]) + ("…" if len(doomed) > 8 else "")
-            self.logger.info("清理终态任务记录 %d 个: %s", len(doomed), shown)
+            self.logger.info("清理终态任务记录 %d 个: %s（已记入墓碑，不会因 tasks.yaml 再次重跑）", len(doomed), shown)
         return doomed
+
+    def _remember_finished(self, task: Task) -> None:
+        """记住已结束任务的指纹（墓碑），防止 tasks.yaml 里的旧条目把它重新导入。
+
+        为什么需要: ``queue.finished_retention_hours`` 会把过期记录从 state.json 删掉，
+        而 tasks.yaml 是声明式提交文件 —— 没有墓碑时，一条「没写 status」的旧条目
+        在记录被删后会被当成**全新提交**，于是同一个实验无限重跑。
+        """
+        self.finished[task.name] = {
+            "identity": task.identity_signature(),
+            "signature": task.signature or task.compute_signature(),
+            "status": task.status,
+            "finished_at": task.finished_at or task.created_at,
+            "archived_at": time.time(),
+        }
+        limit = int(self.cfg.queue.archive_max_entries)
+        if limit > 0 and len(self.finished) > limit:
+            oldest = sorted(self.finished, key=lambda n: self.finished[n].get("archived_at", 0.0))
+            for name in oldest[: len(self.finished) - limit]:
+                self.finished.pop(name, None)
 
     # ------------------------------------------------------------------ #
     # 从 tasks.yaml 导入（幂等）
@@ -656,7 +772,21 @@ class QueueManager:
                 continue
 
             if existing is None:
+                tomb = self.finished.get(candidate.name)
+                if tomb is not None and tomb.get("identity") == candidate.identity_signature():
+                    # 已经跑完（记录被 retention 清掉了），而 tasks.yaml 里的定义一字未改
+                    # → 绝不重跑。想重跑请改命令（换实验参数）或换个任务名。
+                    result.archived.append(candidate.name)
+                    if candidate.name not in self._archived_logged:
+                        self._archived_logged.add(candidate.name)
+                        self.logger.info(
+                            "tasks.yaml 中 %s 已跑完（记录已过期删除），内容未变 → 不再重跑；"
+                            "想重跑请改 command 或换任务名",
+                            candidate.name,
+                        )
+                    continue
                 candidate.seq = self._take_seq()
+                self.finished.pop(candidate.name, None)
                 self.tasks[candidate.name] = candidate
                 result.added.append(candidate.name)
                 continue
@@ -665,7 +795,19 @@ class QueueManager:
                 result.skipped.append(candidate.name)
                 continue
 
-            # 内容变了 → 新提交
+            # 内容变了 —— 但已结束任务只在「真影响结果」的字段变了才重跑
+            if existing.is_terminal and existing.identity_signature() == candidate.identity_signature():
+                existing.priority = candidate.priority
+                existing.notes = candidate.notes
+                existing.signature = candidate.signature
+                result.skipped.append(candidate.name)
+                self.logger.info(
+                    "tasks.yaml 中 %s 只改了优先级/备注（已结束 %s）——不重跑",
+                    candidate.name, existing.status,
+                )
+                continue
+
+            # 内容真变了 → 新提交
             if existing.is_running:
                 result.replaced_running.append(existing.name)
                 self.logger.warning(
@@ -675,6 +817,12 @@ class QueueManager:
                 )
                 continue
 
+            if existing.is_terminal:
+                self.logger.warning(
+                    "tasks.yaml 中 %s 的定义已变化（已结束 %s）→ 视为新提交并重新入队；"
+                    "不想重跑请把它标成 status: cancelled",
+                    existing.name, existing.status,
+                )
             candidate.seq = self._take_seq() if existing.is_terminal else existing.seq
             self.tasks[candidate.name] = candidate
             result.replaced.append(candidate.name)

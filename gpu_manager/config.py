@@ -194,6 +194,8 @@ class NotifyConfig:
     on_task_failed: bool = True
     on_task_queued: bool = True
     on_error: bool = True
+    #: 暂停/恢复调度时是否发通知
+    on_pause: bool = True
     idle_cooldown_seconds: int = 1800
     min_idle_gpus_to_notify: int = 1
     failure_cooldown_seconds: int = 0
@@ -218,6 +220,9 @@ class QueueConfig:
     max_finished_in_reply: int = 5
     #: 已结束任务记录的保留小时数；超时由 daemon 自动删除（0 = 永久保留）
     finished_retention_hours: int = 72
+    #: 「墓碑」容量：记录被删除后仍记住它跑过（name + 内容指纹），防止 tasks.yaml
+    #: 里的旧条目被当成新提交重跑。0 = 不限制。
+    archive_max_entries: int = 500
 
     def validate(self) -> None:
         if self.max_unfinished_in_reply < 1:
@@ -234,6 +239,11 @@ class QueueConfig:
             raise ConfigError(
                 "queue.finished_retention_hours 必须 >= 0，"
                 f"实际是 {self.finished_retention_hours}"
+            )
+        if self.archive_max_entries < 0:
+            raise ConfigError(
+                "queue.archive_max_entries 必须 >= 0，"
+                f"实际是 {self.archive_max_entries}"
             )
 
 
@@ -624,7 +634,7 @@ def _build(raw: dict[str, Any], base_dir: Path, source: Path | None) -> Config:
     no = NotifyConfig()
     for key in (
         "on_gpu_idle", "on_task_started", "on_task_finished", "on_task_failed",
-        "on_task_queued", "on_error", "mention_all_on_idle", "mention_all_on_failure",
+        "on_task_queued", "on_error", "on_pause", "mention_all_on_idle", "mention_all_on_failure",
     ):
         setattr(no, key, _get_bool(sec, key, getattr(no, key), "notify"))
     no.idle_cooldown_seconds = _get_int(sec, "idle_cooldown_seconds", no.idle_cooldown_seconds, "notify", minimum=0)
@@ -643,6 +653,9 @@ def _build(raw: dict[str, Any], base_dir: Path, source: Path | None) -> Config:
     )
     qu.finished_retention_hours = _get_int(
         sec, "finished_retention_hours", qu.finished_retention_hours, "queue", minimum=0
+    )
+    qu.archive_max_entries = _get_int(
+        sec, "archive_max_entries", qu.archive_max_entries, "queue", minimum=0
     )
     qu.validate()
     cfg.queue = qu

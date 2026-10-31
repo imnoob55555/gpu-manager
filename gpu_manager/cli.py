@@ -182,6 +182,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("restart", help="重启 daemon（等价 stop + start）")
     sub.add_parser("reload", help="重新加载配置与 tasks.yaml")
 
+    # ---- pause / resume ----
+    sub.add_parser(
+        "pause",
+        help="暂停调度：停止运行中任务并重新排队（不判失败），不再启动新任务",
+    )
+    sub.add_parser("resume", help="恢复调度：pending 任务重新开始排队")
+
     # ---- status ----
     p = sub.add_parser("status", help="查看 GPU / 模式 / 队列状态")
     p.add_argument("--watch", type=float, nargs="?", const=2.0, default=None, help="每 N 秒刷新（默认 2）")
@@ -533,6 +540,44 @@ class Cli:
         return 0
 
     # ------------------------------------------------------------------ #
+    # pause / resume
+    # ------------------------------------------------------------------ #
+    def _cmd_control(self, action: str) -> int:
+        """暂停/恢复：调度状态归 daemon 所有，所以只在在线时执行。"""
+        label = "暂停" if action == "pause" else "恢复"
+        response = self.daemon_request(action, {"by": "CLI"}, timeout=10.0)
+        if response is None or not response.get("ok"):
+            self.err(f"daemon 未在运行，无法{label}（调度状态由 daemon 管理，请先 start）")
+            return 1
+        want = action == "pause"
+
+        def _applied() -> bool:
+            resp = self.daemon_request("status", timeout=5.0)
+            data = (resp or {}).get("data") if isinstance(resp, dict) else None
+            return bool(((data or {}).get("paused") or {}).get("active")) is want
+
+        if wait_until(_applied, 15.0, interval=0.4):
+            if want:
+                self.out(
+                    self.style(
+                        "✔ 调度已暂停：运行中任务已请求停止（结束后重新排队），pending 不再启动",
+                        "yellow",
+                    )
+                )
+                self.out(self.style("  恢复：gpu-manager resume", "dim"))
+            else:
+                self.out(self.style("✔ 调度已恢复：pending 任务将按优先级重新排队", "green"))
+            return 0
+        self.err(f"已受理{label}请求，但 15 秒内未确认生效；看 `gpu-manager logs -n 30`")
+        return 1
+
+    def cmd_pause(self, args: argparse.Namespace) -> int:
+        return self._cmd_control("pause")
+
+    def cmd_resume(self, args: argparse.Namespace) -> int:
+        return self._cmd_control("resume")
+
+    # ------------------------------------------------------------------ #
     # status
     # ------------------------------------------------------------------ #
     def cmd_status(self, args: argparse.Namespace) -> int:
@@ -597,6 +642,7 @@ class Cli:
                     {
                         "daemon": payload.get("daemon"),
                         "mode": payload.get("mode"),
+                        "paused": payload.get("paused") or {},
                         "counts": payload.get("counts"),
                         "tasks": payload.get("tasks"),
                         "gpus": snapshot_rows,
@@ -643,6 +689,15 @@ class Cli:
             f"completed={counts.get('completed', 0)} failed={counts.get('failed', 0)} "
             f"cancelled={counts.get('cancelled', 0)}"
         )
+        paused = payload.get("paused") or {}
+        if isinstance(paused, dict) and paused.get("active"):
+            self.out(
+                self.style(
+                    f"⏸️ 调度已暂停（自 {fmt_ts(paused.get('since'))}，{paused.get('by') or '未知来源'}）"
+                    " —— `gpu-manager resume` 恢复",
+                    "yellow",
+                )
+            )
         # 交互查询（默认关闭；只开了才显示，避免干扰日常输出）
         interactive = payload.get("interactive")
         if not isinstance(interactive, dict):
@@ -1620,6 +1675,8 @@ def main(argv: list[str] | None = None) -> int:
         "stop": cli.cmd_stop,
         "restart": cli.cmd_restart,
         "reload": cli.cmd_reload,
+        "pause": cli.cmd_pause,
+        "resume": cli.cmd_resume,
         "status": cli.cmd_status,
         "list": cli.cmd_list,
         "show": cli.cmd_show,

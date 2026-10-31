@@ -656,3 +656,63 @@ def test_render_tasks_and_eta_show_stage():
 def test_render_tasks_without_stage_has_no_stage_noise():
     text = CommandRouter().handle("队列", make_context())
     assert "阶段" not in text, "未声明 stage_file 的任务不应出现阶段字样"
+
+
+# --------------------------------------------------------------------------- #
+# 暂停 / 恢复（唯一的两个写操作）
+# --------------------------------------------------------------------------- #
+def test_pause_command_calls_controller_with_user():
+    calls: list[str] = []
+
+    def controller(user: str) -> str:
+        calls.append(user)
+        return "已受理暂停请求"
+
+    ctx = make_context(pause_controller=controller)
+    assert CommandRouter().handle("暂停", ctx, "ou_me") == "已受理暂停请求"
+    assert calls == ["ou_me"], "回执要能记录触发者（审计）"
+
+
+def test_resume_command_calls_controller():
+    calls: list[str] = []
+
+    def controller(user: str) -> str:
+        calls.append(user)
+        return "已受理恢复请求"
+
+    ctx = make_context(resume_controller=controller)
+    assert CommandRouter().handle("恢复", ctx, "ou_me") == "已受理恢复请求"
+    assert calls == ["ou_me"]
+
+
+def test_pause_resume_aliases():
+    for text in ("暂停", "pause", "停止调度", "PAUSE"):
+        assert CommandRouter.normalize(text)[0] == "pause", text
+    for text in ("恢复", "resume", "继续", "开始调度"):
+        assert CommandRouter.normalize(text)[0] == "resume", text
+
+
+def test_pause_without_controller_is_explicit():
+    ctx = make_context(pause_controller=None, resume_controller=None)
+    assert "未启用" in CommandRouter().handle("暂停", ctx, "ou_me")
+    assert "未启用" in CommandRouter().handle("恢复", ctx, "ou_me")
+
+
+def test_controller_exception_is_reported_not_raised():
+    def boom(_user: str) -> str:
+        raise RuntimeError("daemon down")
+
+    ctx = make_context(pause_controller=boom)
+    text = CommandRouter().handle("暂停", ctx, "ou_me")
+    assert "操作失败" in text and "RuntimeError" in text
+
+
+def test_status_shows_paused_badge():
+    text = CommandRouter().handle("状态", make_context(paused=True))
+    assert "调度已暂停" in text
+    assert "调度已暂停" not in CommandRouter().handle("状态", make_context(paused=False))
+
+
+def test_help_mentions_pause_and_resume():
+    text = CommandRouter().handle("帮助", make_context())
+    assert "暂停" in text and "恢复" in text

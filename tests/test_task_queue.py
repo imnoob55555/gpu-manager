@@ -466,3 +466,191 @@ def test_purge_finished_falls_back_to_created_at(cfg):
 
     assert qm.purge_finished(before=now - 72 * 3600) == ["legacy"]
     assert qm.get("legacy") is None
+
+
+# --------------------------------------------------------------------------- #
+# 已结束任务的「墓碑」：记录被 retention 删掉后不得被 tasks.yaml 重新导入
+#
+# 回归测试: 曾经 purge 掉一条已完成记录后，tasks.yaml 里那条没写 status 的旧条目
+# 会被当成**新提交**重新入队，于是同一个实验被无限重训（实测浪费 171 GPU·小时）。
+# --------------------------------------------------------------------------- #
+def test_purged_task_is_not_reimported_from_queue_file(cfg, workdir):
+    qm = make_qm(cfg)
+    now = 1_700_000_000.0
+    write_tasks(cfg, [spec(name="exp", cwd=str(workdir), command="python main.py --epochs 100")])
+    qm.import_queue_file()
+    done = qm.require("exp")
+    qm.mark_finished(done, status=COMPLETED, exit_code=0)
+    done.finished_at = now - 100 * 3600
+
+    assert qm.purge_finished(before=now - 72 * 3600) == ["exp"]
+    assert qm.get("exp") is None, "记录已删除（list 看不到）"
+
+    result = qm.import_queue_file()
+
+    assert result.added == [], "同一条定义不得被当成新提交"
+    assert result.archived == ["exp"]
+    assert qm.get("exp") is None
+    assert "exp" in qm.finished, "墓碑必须记住它跑过"
+
+
+def test_purged_task_reruns_only_when_definition_changes(cfg, workdir):
+    """想重跑同一个实验 → 改 command（新的实验参数）或换名字，而不是改 priority。"""
+    qm = make_qm(cfg)
+    now = 1_700_000_000.0
+    write_tasks(cfg, [spec(name="exp", cwd=str(workdir), command="python main.py --epochs 100")])
+    qm.import_queue_file()
+    done = qm.require("exp")
+    qm.mark_finished(done, status=COMPLETED, exit_code=0)
+    done.finished_at = now - 100 * 3600
+    qm.purge_finished(before=now - 72 * 3600)
+
+    write_tasks(cfg, [spec(name="exp", cwd=str(workdir), command="python main.py --epochs 100 --seed 1")])
+    result = qm.import_queue_file()
+
+    assert result.added == ["exp"]
+    assert qm.require("exp").status == PENDING
+    assert "exp" not in qm.finished, "真的重跑了，墓碑要清掉"
+
+
+def test_finished_task_cosmetic_edit_does_not_requeue(cfg, workdir):
+    """priority / notes 只影响排队与展示，改了不该让一个已完成实验重跑。"""
+    qm = make_qm(cfg)
+    write_tasks(cfg, [spec(name="exp", cwd=str(workdir), priority=10, notes="v1")])
+    qm.import_queue_file()
+    done = qm.require("exp")
+    qm.mark_finished(done, status=COMPLETED, exit_code=0)
+
+    write_tasks(cfg, [spec(name="exp", cwd=str(workdir), priority=99, notes="改个备注")])
+    result = qm.import_queue_file()
+
+    assert result.replaced == [] and result.added == []
+    assert qm.require("exp").status == COMPLETED, "终态不得被改写回 pending"
+    assert qm.require("exp").priority == 99, "展示字段仍然更新"
+    assert qm.require("exp").notes == "改个备注"
+
+
+def test_finished_task_real_edit_still_requeues(cfg, workdir):
+    """真改了 command 才算「新的实验」——这是文档承诺的行为，保留。"""
+    qm = make_qm(cfg)
+    write_tasks(cfg, [spec(name="exp", cwd=str(workdir), command="python v1.py")])
+    qm.import_queue_file()
+    done = qm.require("exp")
+    qm.mark_finished(done, status=CANCELLED, exit_code=None)
+
+    write_tasks(cfg, [spec(name="exp", cwd=str(workdir), command="python v2.py")])
+    result = qm.import_queue_file()
+
+    assert result.replaced == ["exp"]
+    assert qm.require("exp").status == PENDING
+    assert qm.require("exp").command == "python v2.py"
+
+
+def test_finished_archive_survives_state_roundtrip(cfg):
+    qm = make_qm(cfg)
+    task = qm.add(spec(name="exp"))
+    qm.mark_finished(task, status=COMPLETED, exit_code=0)
+    qm.purge_finished(before=task.finished_at + 1)
+
+    state: dict[str, Any] = {}
+    qm.dump(state)
+    restored = make_qm(cfg)
+    restored.load(state)
+
+    assert "exp" in restored.finished
+    assert restored.finished["exp"]["status"] == COMPLETED
+
+
+def test_finished_archive_respects_max_entries(cfg):
+    cfg.queue.archive_max_entries = 3
+    qm = make_qm(cfg)
+    for i in range(5):
+        task = qm.add(spec(name=f"t{i}"))
+        qm.mark_finished(task, status=COMPLETED, exit_code=0)
+        task.finished_at = 1000.0 + i
+        qm.purge_finished(before=10_000.0)
+
+    assert len(qm.finished) == 3
+    assert sorted(qm.finished) == ["t2", "t3", "t4"], "留下最新的 3 条"
+
+
+def test_remove_terminal_task_leaves_tombstone(cfg, workdir):
+    """CLI remove 掉一条终态任务后，tasks.yaml 里的同名旧条目也不得把它复活。"""
+    qm = make_qm(cfg)
+    write_tasks(cfg, [spec(name="exp", cwd=str(workdir))])
+    qm.import_queue_file()
+    done = qm.require("exp")
+    qm.mark_finished(done, status=COMPLETED, exit_code=0)
+
+    qm.remove("exp")
+    result = qm.import_queue_file()
+
+    assert result.added == [] and result.archived == ["exp"]
+    assert qm.get("exp") is None
+
+
+def test_explicit_add_clears_tombstone(cfg, workdir):
+    """显式重新 add 是「我确实要再跑一遍」→ 墓碑必须清掉。"""
+    qm = make_qm(cfg)
+    task = qm.add(spec(name="exp"))
+    qm.mark_finished(task, status=CANCELLED, exit_code=None)
+    qm.purge_finished(before=task.finished_at + 1)
+    assert "exp" in qm.finished
+
+    qm.add(spec(name="exp"))
+
+    assert "exp" not in qm.finished
+    assert qm.require("exp").status == PENDING
+
+
+# --------------------------------------------------------------------------- #
+# 暂停调度（停止后重新排队）
+# --------------------------------------------------------------------------- #
+def test_request_pause_marks_running_tasks_only(cfg):
+    qm = make_qm(cfg)
+    running = qm.add(spec(name="run1"))
+    qm.mark_running(running, gpu_ids=[0], pid=1, pgid=1, proc_start_time=None, log_file="")
+    pending = qm.add(spec(name="wait1"))
+
+    marked = qm.request_pause()
+
+    assert marked == ["run1"]
+    assert running.stop_requested and running.pause_requested
+    assert running.stop_reason == "pause"
+    assert not pending.stop_requested and not pending.pause_requested
+
+
+def test_requeue_after_pause_keeps_seq_and_retries_but_clears_runtime(cfg):
+    qm = make_qm(cfg)
+    task = qm.add(spec(name="t1", priority=7))
+    seq = task.seq
+    created = task.created_at
+    qm.mark_running(task, gpu_ids=[0, 1], pid=123, pgid=123, proc_start_time=5.0, log_file="/l.log")
+    task.retries = 2
+    task.progress = {"epoch|500": [{"done": 10}]}
+    task.stage = "training"
+    task.pause_requested = True
+    qm.mark_finished(task, status=COMPLETED, exit_code=0)
+
+    qm.requeue_after_pause(task)
+
+    assert task.status == PENDING
+    assert task.seq == seq and task.created_at == created, "暂停不该让任务插队或重置提交时间"
+    assert task.retries == 2, "暂停不是任务的错，不消耗重试次数"
+    assert task.pid is None and task.gpu_ids == [] and task.exit_code is None
+    assert task.finished_at is None and task.started_at is None
+    assert task.progress == {} and task.stage == "", "重跑从第 0 轮开始，旧进度必须清掉"
+    assert not task.pause_requested and not task.stop_requested
+
+
+def test_cancel_clears_pause_intent(cfg):
+    """暂停期间用户改主意取消 → 不应该再被当成「暂停后重排队」。"""
+    qm = make_qm(cfg)
+    task = qm.add(spec(name="t1"))
+    qm.mark_running(task, gpu_ids=[0], pid=1, pgid=1, proc_start_time=None, log_file="")
+    qm.request_pause()
+    assert task.pause_requested
+
+    qm.cancel("t1")
+    assert not task.pause_requested
+    assert task.stop_requested and task.stop_reason == "cancel"

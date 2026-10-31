@@ -109,6 +109,7 @@ tasks:
 | `start [--foreground] [--dry-run] [--no-launch]` | 后台常驻启动；`--dry-run` 不发飞书（只写日志），`--no-launch` 只做调度决策不启动任务 |
 | `stop [--force]` | 停止 daemon（**不杀训练任务**） |
 | `restart` / `reload` | 重启 / 热重载配置与 `tasks.yaml`（也可 `kill -HUP <pid>`） |
+| `pause` / `resume` | 暂停 / 恢复调度（暂停＝停止运行中任务并**重新排队**，不判失败） |
 | `status [--watch] [--json]` | GPU 利用率/显存/空闲确认进度/可调度性/占用者 + 模式 + 队列 + 看门狗告警 |
 | `list [--status S] [--json]` | 任务列表（活跃在前） |
 | `show NAME` | 单任务详情（含实际执行的等效命令） |
@@ -121,6 +122,11 @@ tasks:
 | `doctor [--notify-test]` | 环境自检 |
 | `prune [--dry-run] [--usage]` | 清理过期日志/查看磁盘占用（上限见 `storage` 段） |
 | `watchdog [status\|diagnostics [任务]] [--show]` | 看门狗状态 / 诊断快照（只读；无任务时看门狗自动关闭） |
+
+**`tasks.yaml` 与「已跑完」的任务**：文件里的条目会被 daemon 反复导入，所以一条跑完的旧条目
+只要内容不变就**不会被重跑**（即使它的运行记录已被 `queue.finished_retention_hours` 清掉，
+`state.json` 的 `finished` 墓碑也记得它）。确认不再需要就把该条目标成 `status: cancelled`，
+最稳妥；想重跑同一个实验，请改命令/换任务名（改 `priority`、`notes` 不会触发重跑）。
 
 调试用：`./bin/gpu-manager start --foreground --dry-run --no-launch`
 （前台跑、不发消息、只决策不启动，可安全验证逻辑）。
@@ -166,6 +172,21 @@ gpu:
 
 `max_concurrent_tasks`(默认 0=不限) 可限制同时运行的任务数。
 
+### 暂停调度（飞书「暂停」/ `gpu-manager pause`）
+
+暂停的语义是**「腾卡」而不是「冻结」**：
+
+1. 停止所有运行中任务（走与取消同一条经过身份校验的 SIGTERM → grace → SIGKILL 路径）
+2. 进程退出后把它们**重新排队**为 `pending`：不判失败、不消耗重试次数、保留原提交顺序
+3. 不再启动任何 pending 任务（`status` 的等待原因会显示「调度已暂停」）
+
+代价是**当前 epoch 的进度会丢**（重跑从第 0 轮开始）；换来的是 GPU 立刻真正空出来。
+暂停期间：**静音空闲提醒**（否则空卡会反复响）、**看门狗不报停滞**（只有进程异常照常告警）、
+状态持久化在 `state.json`（daemon 重启后仍是暂停，不会一重启就开跑）。
+
+恢复（「恢复」/ `gpu-manager resume`）后 pending 任务按原有优先级重新排队；
+暂停/恢复都会发通知（`notify.on_pause` 可关）。
+
 ### 通知去重与降级
 
 - 空闲提醒按「空闲卡集合签名 + 冷却时间(`idle_cooldown_seconds`)」去重，避免 checkpoint
@@ -200,6 +221,9 @@ gpu:
 - **已结束任务的记录**（state.json 里的 completed/failed/cancelled）保留
   `queue.finished_retention_hours`（默认 72 小时），超时由 daemon 自动删除；
   删除后 `gpu-manager list/show` 也查不到（日志文件另受上面的上限约束）
+- 删除记录时会在 `state.json` 的 `finished` 段留一条**墓碑**（任务名 + 内容指纹，
+  上限 `queue.archive_max_entries`）：`tasks.yaml` 里那条没写 `status` 的旧条目不会被
+  当成新提交重跑，因此“删记录”与“重训”彻底解耦
 - 总量超限时**先删成功任务的日志**，失败任务的留久一点
   （`prefer_keep_failed_logs: true`）
 - daemon 每 `storage.prune_interval_seconds`（默认 300 秒）自动检查一次；
@@ -256,9 +280,12 @@ gpu-manager watchdog diagnostics exp1 --show   # 打印某任务最新一份摘�
 | `队列` | 任务列表：最多 10 个未完成 + 5 个已结束（72 小时内），含进度/预计/等待原因 |
 | `预计` | 运行中任务的预计结束 + 各卡预计空出时间 |
 | `日志 <任务名> [行数]` | 该任务日志尾部（默认 20 行） |
+| `暂停` | 暂停调度：停止运行中任务并重新排队（不判失败），pending 不再启动 |
+| `恢复` | 恢复调度：pending 任务按优先级重新排队 |
 | `帮助` | 命令表 |
 
-- **只读**：没有取消任务等写操作，发错命令也不会影响训练
+- **只读为主**：除「暂停 / 恢复」外全部只读；这两个写操作也必须通过 `feishu.allowed_users` 白名单，
+  且全量审计到 `events.jsonl`（`scheduler_paused` / `scheduler_resumed`）
 - **fail-closed 白名单**：`feishu.allowed_users` 为空时拒绝所有人；
   未授权消息不回内容，只在日志里打印对方 open_id（方便你加入白名单）
 - 预计结束时间由日志进度（tqdm / `Epoch x/y` / `step x/y`）两点采样外推；

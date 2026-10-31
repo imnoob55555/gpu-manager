@@ -11,10 +11,13 @@
     ``队列`` / ``tasks`` / ``list``      任务列表（进度 + 预计结束）
     ``预计`` / ``eta``                   运行中任务的预计结束 + 每张卡预计空出时间
     ``日志 <任务名> [行数]``              该任务日志尾部（默认 20 行，最多 100）
+    ``暂停`` / ``pause``               暂停调度：停掉运行中任务并**重新排队**（不判失败）
+    ``恢复`` / ``resume``              恢复调度：pending 任务重新开始排队
     ``帮助`` / ``help`` / ``?``          命令表
 
 硬性安全边界（都有测试锁定）:
-  · **只读**：没有任何写操作，发错命令也不会影响训练
+  · **只读为主**：仅「暂停 / 恢复」两个写操作，且必须通过 open_id 白名单；
+    其余命令发错也不会影响训练
   · **open_id 白名单 fail-closed**：未配置 = 拒绝所有人；未授权消息不回内容，
     只记日志（并打印对方 open_id，方便你加进白名单）
   · 每用户限流（默认 10 条/分钟），并对 message_id 去重（飞书事件至少投递一次）
@@ -63,6 +66,8 @@ COMMAND_ALIASES: dict[str, str] = {
     "队列": "tasks", "任务": "tasks", "list": "tasks", "tasks": "tasks", "queue": "tasks",
     "预计": "eta", "eta": "eta", "何时": "eta", "完成时间": "eta", "结束时间": "eta",
     "日志": "log", "log": "log", "logs": "log", "输出": "log",
+    "暂停": "pause", "pause": "pause", "停止调度": "pause",
+    "恢复": "resume", "resume": "resume", "继续": "resume", "开始调度": "resume",
     "帮助": "help", "help": "help", "?": "help", "？": "help", "命令": "help",
 }
 
@@ -152,6 +157,11 @@ class BotContext:
     queue_max_finished: int = 5
     #: 已结束任务的时间窗口（秒）；0 = 不按时间过滤（永久保留）
     finished_window_seconds: float = 72 * 3600.0
+    #: 调度是否处于暂停状态
+    paused: bool = False
+    #: 写操作回调（daemon 注入；None = 未启用）
+    pause_controller: Callable[[str], str] | None = None
+    resume_controller: Callable[[str], str] | None = None
 
 
 @dataclass
@@ -241,11 +251,13 @@ class MessageDeduper:
 # 命令路由（纯逻辑）
 # --------------------------------------------------------------------------- #
 HELP_TEXT = """\
-可用命令（只读，发错也不会影响训练）:
+可用命令（除「暂停/恢复」外都只读）:
   状态        GPU 利用率/显存/占用者/可调度性
   队列        任务列表（进度与预计结束）
   预计        运行中任务的预计结束 + 各卡预计空出时间
   日志 <任务名> [行数]   任务日志尾部（默认 20 行）
+  暂停        暂停调度：停止运行中任务并重新排队（不判失败），不再启动新任务
+  恢复        恢复调度：pending 任务重新开始排队
   帮助        显示本说明"""
 
 
@@ -266,9 +278,13 @@ class CommandRouter:
         command = COMMAND_ALIASES.get(parts[0].lower(), COMMAND_ALIASES.get(parts[0], ""))
         return command, parts[1:]
 
-    def handle(self, text: str, ctx: BotContext) -> str:
+    def handle(self, text: str, ctx: BotContext, user: str = "") -> str:
         """返回回复文本；无法识别时仍给帮助（而不是沉默）。"""
         command, args = self.normalize(text)
+        if command == "pause":
+            return self._control(ctx.pause_controller, "pause", user)
+        if command == "resume":
+            return self._control(ctx.resume_controller, "resume", user)
         if command == "status":
             return self.render_status(ctx)
         if command == "tasks":
@@ -283,6 +299,17 @@ class CommandRouter:
             return "没看懂这条消息。\n\n" + HELP_TEXT
         return f"未知命令 `{command}`。\n\n" + HELP_TEXT
 
+    def _control(
+        self, controller: Callable[[str], str] | None, action: str, user: str
+    ) -> str:
+        """执行写操作（暂停/恢复）。控制器由 daemon 注入，未注入时明确告知。"""
+        if controller is None:
+            return "暂停/恢复未启用（daemon 未注入控制器）。"
+        try:
+            return controller(user)
+        except Exception as exc:  # 写操作异常不能把长连接线程搞挂
+            return f"操作失败: {type(exc).__name__}（详见 daemon 日志）"
+
     # ------------------------------------------------------------------ #
     def render_status(self, ctx: BotContext) -> str:
         lines = [
@@ -290,6 +317,8 @@ class CommandRouter:
             f"模式 {ctx.mode} · 队列 pending={ctx.counts.get('pending', 0)}"
             f" running={ctx.counts.get('running', 0)}",
         ]
+        if ctx.paused:
+            lines.append("⏸️ 调度已暂停（发「恢复」继续；pending 任务不会启动）")
         if ctx.gpu_error and not ctx.gpus:
             lines.append(f"⚠️ nvidia-smi 读取失败: {truncate(ctx.gpu_error, 200)}")
             return self._finish(lines)
@@ -693,7 +722,7 @@ class FeishuBot:
 
         try:
             context = self.context_provider()
-            reply = self.router.handle(request.text, context)
+            reply = self.router.handle(request.text, context, request.user_id)
         except Exception as exc:  # 任何内部错误都不能让长连接线程死掉
             self.logger.exception("处理飞书命令失败: %s", exc)
             reply = f"内部错误: {type(exc).__name__}（详见 daemon 日志）"

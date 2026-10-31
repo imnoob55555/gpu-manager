@@ -533,3 +533,53 @@ def test_reconfigure_keeps_alert_history(cfg, workdir):
     w.reconfigure(cfg)
     assert w.watches["t1"].alert_count == 1, "换阈值不应清掉告警历史（否则会重复刷屏）"
     assert w.wcfg.stall_threshold_seconds == 7200
+
+
+# --------------------------------------------------------------------------- #
+# 暂停调度期间：不判停滞，但进程异常照常上报
+# --------------------------------------------------------------------------- #
+def test_allow_stall_false_suppresses_stall(cfg, workdir):
+    w = make_watchdog(
+        cfg, check_interval_seconds=10, stall_threshold_seconds=60, startup_grace_seconds=0
+    )
+    task = make_task(cfg, workdir, uptime=20_000, log_age=20_000)
+    now = NOW()
+
+    assert w.update([task], now=now, allow_stall=False) == [], "暂停期间不得报停滞"
+    assert w.update([task], now=now + 70, allow_stall=False) == []
+    # 恢复调度后照常判定
+    events = w.update([task], now=now + 140, allow_stall=True)
+    assert [e.kind for e in events] == ["stall"]
+
+
+def test_allow_stall_false_keeps_process_anomaly(cfg, workdir, monkeypatch):
+    w = make_watchdog(
+        cfg,
+        check_interval_seconds=10,
+        stall_threshold_seconds=999_999,
+        anomaly_confirm_checks=1,
+    )
+    task = make_task(cfg, workdir, log_age=0)
+    monkeypatch.setattr(watchdog_module, "process_alive", lambda pid: False)
+    monkeypatch.setattr(watchdog_module, "process_state", lambda pid: "Z")
+
+    events = w.update([task], now=NOW(), allow_stall=False)
+
+    assert [e.kind for e in events] == ["anomaly:zombie"], "暂停不掩盖真正的进程异常"
+
+
+def test_allow_stall_false_does_not_emit_stall_recovery(cfg, workdir):
+    """暂停前就在告警停滞的任务，暂停期间不能把「被停住」当成恢复。"""
+    w = make_watchdog(
+        cfg, check_interval_seconds=10, stall_threshold_seconds=60, startup_grace_seconds=0
+    )
+    task = make_task(cfg, workdir, uptime=20_000, log_age=20_000)
+    now = NOW()
+    assert [e.kind for e in w.update([task], now=now)] == ["stall"]
+
+    assert w.update([task], now=now + 20, allow_stall=False) == [], "暂停期间不发恢复、不重复告警"
+    assert w.watches["t1"].alert_kind == "stall", "告警状态保留，恢复后再判"
+
+    os.utime(task.log_file, (now + 30, now + 30))
+    events = w.update([task], now=now + 31, allow_stall=True)
+    assert [e.kind for e in events] == ["recovered"]

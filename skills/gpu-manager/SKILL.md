@@ -26,8 +26,8 @@ compatibility: 需要本机已安装 gpu-manager（clone 后 `pip install -e .`�
 1. **对他人只读**：绝不对其他用户的进程发信号、不 kill、不清显存、不 reset GPU、不用 sudo。
 2. **只操作本工具管理的任务**：`cancel` 只对**你自己启动的进程组**发 TERM→KILL。
 3. **权威状态在 `data/state.json`**；`tasks.yaml` 只是提交入口，daemon 只读它。
-4. **影响在跑训练的动作先问用户**：`cancel`、`stop`/`restart` daemon、改 `config.yaml` 阈值。
-   （`restart` 本身不杀训练任务，但会短暂停调度。）
+4. **影响在跑训练的动作先问用户**：`cancel`、`pause`、`stop`/`restart` daemon、改 `config.yaml` 阈值。
+   （`restart` 本身不杀训练任务，但会短暂停调度；`pause` 会**停掉运行中任务**并重新排队。）
 5. 改配置 → `gpu-manager reload` 即可；**改了代码/新增模块才需要 `restart`**。
 
 ## 状态与查询
@@ -120,7 +120,9 @@ gpu-manager prune             # 立即清理
 ## 通知与飞书
 
 - 推送：空闲提醒、任务启动/完成/失败、看门狗告警（`config.yaml` 的 `notify` / `feishu`）
-- 交互查询（**只读**，白名单 fail-closed）：发「状态」「队列」「预计」「日志 <任务> [行数]」「帮助」；「队列」最多回 10 个未完成 + 5 个已结束（72h 内），
+- 交互查询（**只读为主**，白名单 fail-closed）：发「状态」「队列」「预计」「日志 <任务> [行数]」「帮助」；
+  **写操作只有「暂停」「恢复」**：暂停 = 停止运行中任务并重新排队（不判失败，当前 epoch 进度会丢）；
+  暂停期间空闲提醒静音、看门狗不报停滞，状态跨重启保持；「队列」最多回 10 个未完成 + 5 个已结束（72h 内），
   超窗的已结束记录会被 daemon 删除（`queue.finished_retention_hours`）
 - 没收到提醒先查：`gpu-manager doctor`；再看 `gpu-manager logs -n 50 | grep -E "通知|未授权"`
 
@@ -132,6 +134,7 @@ gpu-manager prune             # 立即清理
 | 日志里看不到 epoch/step | 脚本把输出重定向到别处 → 在 `tasks.yaml` 填 `eta_logs`（绝对路径）+ `total_epochs` |
 | ETA 明显不对（跨阶段乱） | 配 `stage_file`；阶段变化时旧进度会被丢弃 |
 | 改配置不生效 | `gpu-manager reload`；改代码 / 新增模块才需要 `restart` |
+| 已完成/已取消的任务反复重训 | 旧版 bug：`queue.finished_retention_hours` 删记录后，`tasks.yaml` 里没写 status 的旧条目被当成新提交。已修（`state.json` 的 `finished` 墓碑 + 终态任务只认 command/cwd 这类字段变化）。排查：`grep purge_finished data/events.jsonl` 看清理是否紧跟一条「新增」；把不跑的条目标 `status: disabled` |
 | `list` 状态长期不动 | daemon 没在跑：`gpu-manager status` 第一行；`gpu-manager start` |
 | 机器人不回消息 | 白名单未配（`logs` 里会打印你的 open_id）、SDK 缺失、事件订阅没选长连接 |
 | 看门狗告警太频繁 | 放宽 `watchdog.stall_threshold_seconds` 或加大 `startup_grace_seconds` |

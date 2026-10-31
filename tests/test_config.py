@@ -384,3 +384,9 @@ def test_queue_invalid_values_rejected(tmp_path, key, value):
     path = write(tmp_path, base(queue={key: value}))
     with pytest.raises(ConfigError, match=key):
         load_config(path)
+
+
+def test_notify_on_pause_parsed(tmp_path):
+    assert load_config(write(tmp_path, base())).notify.on_pause is True
+    cfg = load_config(write(tmp_path, base(notify={"on_pause": False})))
+    assert cfg.notify.on_pause is False

@@ -167,6 +167,14 @@ class Daemon:
         self._last_prune = 0.0
         self._last_progress_sample = 0.0
         self._last_finished_purge = 0.0
+        # 暂停调度（飞书「暂停」/ CLI pause）：状态持久化在 state.json，跨重启保持
+        self.paused: bool = False
+        self.paused_at: float = 0.0
+        self.paused_by: str = ""
+        # bot / IPC 线程只登记请求，真正的变更在 tick 内应用（避免跨线程改状态）
+        self._control_request: str = ""
+        self._control_by: str = ""
+        self._paused_idle_logged: bool = False
         self.bot: FeishuBot | None = None
         self.server: ControlServer | None = None
 
@@ -299,6 +307,16 @@ class Daemon:
     # 重启恢复（只读校验，绝不发信号）
     # ================================================================== #
     def _recover_after_restart(self) -> None:
+        restored = self.state.get("paused") or {}
+        if isinstance(restored, dict) and restored.get("active"):
+            self.paused = True
+            self.paused_at = float(restored.get("since") or 0.0)
+            self.paused_by = str(restored.get("by") or "")
+            self.logger.warning(
+                "恢复上次的「已暂停调度」状态（自 %s，%s）——发「恢复」或 `gpu-manager resume` 继续调度",
+                fmt_ts(self.paused_at) if self.paused_at else "未知时间",
+                self.paused_by or "来源未知",
+            )
         running = self.queue.running_tasks()
         if not running:
             self.logger.info("无运行中任务，进入 %s 模式", self._compute_mode())
@@ -380,6 +398,9 @@ class Daemon:
 
             # 2) 收割任务（先收割再决策，模式才准确）
             self._reap_tasks(now)
+
+            # 2b) 暂停/恢复请求（来自飞书或 CLI）：与调度器串行，只在这里改状态
+            self._apply_control_request(now)
 
             # 3) 停止请求（用户取消 / 超时）
             self._process_stop_requests(now)
@@ -494,6 +515,107 @@ class Daemon:
         task.error = f"超时: 运行 {fmt_duration(runtime)} 超过 timeout_seconds={task.timeout_seconds}"
         return True
 
+    # ------------------------------------------------------------------ #
+    # 暂停 / 恢复（写操作；仅白名单用户或 CLI 可触发）
+    # ------------------------------------------------------------------ #
+    def request_control(self, action: str, *, by: str = "") -> None:
+        """登记一个暂停/恢复请求（bot 线程与 IPC 线程的安全入口）。
+
+        真正的状态变更在 tick 内应用 —— 与调度器串行，避免跨线程改队列；
+        这里顺手唤醒主循环，所以从发消息到生效通常不到一轮 tick。
+        """
+        with self.lock:
+            self._control_request = action
+            self._control_by = by
+        self._wake.set()
+        self.logger.info("收到控制请求: %s（来自 %s）", action, by or "未知")
+
+    def _apply_control_request(self, now: float) -> None:
+        with self.lock:
+            action, by = self._control_request, self._control_by
+            self._control_request = ""
+            self._control_by = ""
+        if action == "pause":
+            self._pause(now, by=by)
+        elif action == "resume":
+            self._resume(now, by=by)
+
+    def _pause(self, now: float, *, by: str = "") -> None:
+        """暂停调度：运行中任务优雅停止后**重新排队**，pending 不再启动。"""
+        if self.paused:
+            self.logger.info("已经是暂停状态，忽略重复的暂停请求")
+            return
+        marked = self.queue.request_pause()
+        self.paused = True
+        self.paused_at = now
+        self.paused_by = by
+        self._paused_idle_logged = False
+        self.logger.warning(
+            "已暂停调度（来自 %s）：%d 个运行中任务将被优雅停止并重新排队；pending 不再启动",
+            by or "CLI", len(marked),
+        )
+        self.store.append_event(
+            {"event": "scheduler_paused", "by": by, "stopped": marked}, self.cfg.event_log
+        )
+        if self.cfg.notify.on_pause:
+            lines = [
+                f"**服务器**: {self.cfg.server.resolved_name()}",
+                f"**来源**: {by or 'CLI'}",
+                f"**停止并重新排队**: {len(marked)} 个运行中任务",
+            ]
+            if marked:
+                shown = ", ".join(marked[:6]) + ("…" if len(marked) > 6 else "")
+                lines.append(f"  - {shown}")
+            counts = self.queue.counts()
+            lines += [
+                f"**队列**: pending={counts.get(PENDING, 0)}",
+                "",
+                "任务已重新排队（不判失败）；发「恢复」或 `gpu-manager resume` 继续调度。",
+            ]
+            self._notify("⏸️ 调度已暂停", "\n".join(lines), level="warning")
+
+    def _resume(self, now: float, *, by: str = "") -> None:
+        """恢复调度：pending 任务在本轮 tick 就会开始抢卡。"""
+        if not self.paused:
+            self.logger.info("当前不是暂停状态，忽略恢复请求")
+            return
+        self.paused = False
+        self.paused_at = 0.0
+        self.paused_by = ""
+        # 暂停期间空闲提醒被静音了，签名可能已陈旧 → 清掉，恢复后能重新提醒
+        self.state.setdefault("notify", {})["last_idle_signature"] = ""
+        self.logger.info("已恢复调度（来自 %s）：pending 任务将在本轮开始排队", by or "CLI")
+        self.store.append_event(
+            {"event": "scheduler_resumed", "by": by}, self.cfg.event_log
+        )
+        if self.cfg.notify.on_pause:
+            counts = self.queue.counts()
+            self._notify(
+                "▶️ 调度已恢复",
+                "\n".join(
+                    [
+                        f"**服务器**: {self.cfg.server.resolved_name()}",
+                        f"**来源**: {by or 'CLI'}",
+                        f"**队列**: pending={counts.get(PENDING, 0)} running={counts.get(RUNNING, 0)}",
+                    ]
+                ),
+                level="success",
+            )
+
+    def _bot_control(self, action: str, user: str) -> str:
+        """飞书写操作的唯一入口（白名单已在 bot 层校验过）。返回回执文案。"""
+        self.request_control(action, by=f"飞书 {user}")
+        wait = int(self.cfg.gpu.check_interval_seconds)
+        if action == "pause":
+            return (
+                "⏸️ 已受理暂停请求：运行中任务会被优雅停止并**重新排队**（不判失败），"
+                f"pending 不再启动。下一轮 tick（≤{wait}s）生效。"
+            )
+        return (
+            "▶️ 已受理恢复请求：pending 任务会按优先级重新开始排队。"
+            f"下一轮 tick（≤{wait}s）生效。"
+        )
+
     def _reap_tasks(self, now: float) -> None:
         for task in self.queue.running_tasks():
             handle = self.handles.get(task.name)
@@ -518,6 +640,11 @@ class Daemon:
                 # 仍在运行: 检查运行超时。
                 # 注意这里不能提前 continue，否则 daemon 重启后 timeout_seconds 会失效。
                 self._check_timeout(task, now)
+                continue
+
+            # 因「暂停调度」被停掉的任务：重新排队，不判失败、不消耗重试
+            if task.pause_requested:
+                self._requeue_paused_task(task, exit_code=exit_code, now=now)
                 continue
 
             # 判定终态
@@ -571,6 +698,22 @@ class Daemon:
                 continue
 
             self._finish_task(task, status=status, exit_code=exit_code, error=error)
+
+    def _requeue_paused_task(self, task: Task, *, exit_code: int | None, now: float) -> None:
+        """暂停导致的停止：把任务放回队列而不是判失败。"""
+        self._stop_deadlines.pop(task.name, None)
+        self._stop_sent.discard(task.name)
+        self._stop_notified.discard(task.name)
+        self.handles.pop(task.name, None)
+        self.queue.requeue_after_pause(task)
+        self.logger.info(
+            "任务 %s 因暂停已停止（退出码 %s）并重新排队",
+            task.name, exit_code if exit_code is not None else "未知",
+        )
+        self.store.append_event(
+            {"event": "task_requeued_by_pause", "task": task.name, "exit_code": exit_code},
+            self.cfg.event_log,
+        )
 
     def _finish_task(
         self,
@@ -722,6 +865,12 @@ class Daemon:
         pending = self.queue.pending_tasks()
         self.last_plan = Plan()
         if not pending:
+            return
+        if self.paused:
+            if not self._paused_idle_logged:
+                self._paused_idle_logged = True
+                self.logger.info("已暂停调度：%d 个 pending 任务暂不启动", len(pending))
+            self.last_plan.waiting = [(t.name, "调度已暂停") for t in pending]
             return
         if not self.snapshot.ok:
             self.last_plan.waiting = [(t.name, f"GPU 采集失败: {self.snapshot.error}") for t in pending]
@@ -895,6 +1044,9 @@ class Daemon:
         """
         notify_state = self.state.setdefault("notify", {})
         if not self.cfg.notify.on_gpu_idle:
+            return
+        if self.paused:
+            # 暂停期间静音空闲提醒（否则空着的卡会反复响）；恢复时会重置签名
             return
 
         if self.mode == MODE_IDLE:
@@ -1118,6 +1270,8 @@ class Daemon:
             now=now,
             snapshot=self.snapshot,
             eta_provider=lambda task: self._watchdog_eta_text(task, now),
+            # 暂停期间不判「停滞」（任务被停掉后本就不会再产日志），只看进程异常
+            allow_stall=not self.paused,
         )
         for event in events:
             self.store.append_event(
@@ -1260,6 +1414,9 @@ class Daemon:
                 uptime_seconds=max(0.0, now - self.started_at),
                 gpu_error=snapshot.error,
                 log_reader=self._bot_log_tail,
+                paused=self.paused,
+                pause_controller=lambda user: self._bot_control("pause", user),
+                resume_controller=lambda user: self._bot_control("resume", user),
                 # 回复上限与终态时间窗口（真正删除由 _maybe_purge_finished 负责）
                 queue_max_unfinished=cfg.queue.max_unfinished_in_reply,
                 queue_max_finished=cfg.queue.max_finished_in_reply,
@@ -1394,6 +1551,11 @@ class Daemon:
         self.state["stats"] = self.stats
         self.state["idle"] = self.tracker.to_dict()
         self.state["watchdog"] = self.watchdog.to_dict()
+        self.state["paused"] = {
+            "active": self.paused,
+            "since": self.paused_at,
+            "by": self.paused_by,
+        }
         self.state["waiting"] = [
             {"name": name, "reason": reason} for name, reason in self.last_plan.waiting
         ]
@@ -1552,6 +1714,13 @@ class Daemon:
                 result = self.queue.import_queue_file()
                 self._persist(now)
                 return ok({"import": result.summary(), "config": "已重载"})
+            if command == "pause" or command == "resume":
+                self.request_control(command, by=str(params.get("by") or "CLI"))
+                state = "暂停" if command == "pause" else "恢复"
+                return ok({
+                    "message": f"已受理{state}请求，下一轮 tick 生效",
+                    "paused": self.paused,
+                })
             if command == "stop_daemon":
                 self.logger.info("收到 CLI 停止请求")
                 self.request_stop()
@@ -1573,6 +1742,11 @@ class Daemon:
             },
             "mode": self.mode,
             "mode_since": self.mode_since,
+            "paused": {
+                "active": self.paused,
+                "since": self.paused_at,
+                "by": self.paused_by,
+            },
             "server": cfg.server.resolved_name(),
             "user": cfg.server.resolved_user(),
             "counts": counts,

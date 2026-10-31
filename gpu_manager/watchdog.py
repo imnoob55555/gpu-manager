@@ -233,10 +233,13 @@ class Watchdog:
         now: float | None = None,
         snapshot: Any | None = None,
         eta_provider: Callable[[Any], str] | None = None,
+        allow_stall: bool = True,
     ) -> list[WatchEvent]:
         """推进一轮检查（内部按 ``check_interval_seconds`` 节流）。
 
         返回本轮产生的事件；无任务、未到检查点或功能关闭时返回空列表。
+        ``allow_stall=False`` 时**不判停滞**（暂停调度期间任务本就不会产新日志），
+        但进程异常（消失/僵尸/…) 仍然照常检测——那才是真正的异常。
         """
         now = now if now is not None else time.time()
         task_list = [t for t in tasks if getattr(t, "status", "") == "running"]
@@ -274,7 +277,8 @@ class Watchdog:
                 self.watches[task.name] = watch
             events.extend(
                 self._check_task(
-                    task, watch, now=now, snapshot=snapshot, eta_provider=eta_provider
+                    task, watch, now=now, snapshot=snapshot, eta_provider=eta_provider,
+                    allow_stall=allow_stall,
                 )
             )
         return events
@@ -301,6 +305,7 @@ class Watchdog:
         now: float,
         snapshot: Any | None,
         eta_provider: Callable[[Any], str] | None,
+        allow_stall: bool = True,
     ) -> list[WatchEvent]:
         watch.last_check = now
         watch.proc = self._proc_info(task)
@@ -312,7 +317,8 @@ class Watchdog:
             watch.activity_source = source
         watch.idle_seconds = max(0.0, now - watch.last_activity)
         return self._judge(
-            task, watch, now=now, snapshot=snapshot, eta_provider=eta_provider
+            task, watch, now=now, snapshot=snapshot, eta_provider=eta_provider,
+            allow_stall=allow_stall,
         )
 
     def _judge(
@@ -323,8 +329,9 @@ class Watchdog:
         now: float,
         snapshot: Any | None,
         eta_provider: Callable[[Any], str] | None,
+        allow_stall: bool = True,
     ) -> list[WatchEvent]:
-        issue = self._detect_issue(task, watch, now)
+        issue = self._detect_issue(task, watch, now, allow_stall=allow_stall)
         if issue is not None:
             kind, reason, level = issue
             if watch.alert_kind != kind:
@@ -353,10 +360,15 @@ class Watchdog:
                 )
             ]
         if watch.alert_kind:
+            if not allow_stall and watch.alert_kind == "stall":
+                # 暂停期间任务是「被停住」而不是「恢复了」——不发恢复通知，也不重复告警
+                return []
             return [self._emit_recovery(task, watch, now=now)]
         return []
 
-    def _detect_issue(self, task: Any, watch: TaskWatch, now: float) -> tuple[str, str, str] | None:
+    def _detect_issue(
+        self, task: Any, watch: TaskWatch, now: float, *, allow_stall: bool = True
+    ) -> tuple[str, str, str] | None:
         """返回 ``(kind, reason, level)`` 或 None（无问题）。"""
         proc = watch.proc
         if self.wcfg.instant_process_anomaly and proc.anomaly:
@@ -373,6 +385,9 @@ class Watchdog:
                 watch.anomaly_hits.clear()
             watch.anomaly_kind = ""
 
+        if not allow_stall:
+            # 暂停调度时任务不再产日志，判「停滞」必然是误报（进程异常已在上方处理）
+            return None
         if self._grace_left(task, now) > 0:
             return None
         threshold = float(self.wcfg.stall_threshold_seconds)

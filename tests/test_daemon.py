@@ -858,3 +858,93 @@ def test_purge_finished_records_is_throttled(cfg):
 
     d._maybe_purge_finished(now + daemon_mod.FINISHED_PURGE_INTERVAL + 1)
     assert d.queue.get("later") is None
+
+
+# --------------------------------------------------------------------------- #
+# 暂停 / 恢复调度
+# --------------------------------------------------------------------------- #
+def test_pause_marks_running_tasks_for_requeue_and_emits_event(cfg, workdir):
+    d = Daemon(cfg)
+    task = make_running_task(d, cfg, workdir, log_age=0, uptime=10)
+
+    d._pause(time.time(), by="飞书 ou_me")
+
+    assert d.paused is True and d.paused_by == "飞书 ou_me"
+    assert task.pause_requested is True and task.stop_requested is True
+    events = StateStore.read_events(cfg.event_log, 20)
+    assert any(e.get("event") == "scheduler_paused" for e in events)
+
+
+def test_paused_blocks_launching(cfg, workdir):
+    d = Daemon(cfg)
+    d.queue.add(make_spec("p1", cwd=str(workdir)))
+    d._pause(time.time(), by="CLI")
+
+    d._launch_pending([0], time.time())
+
+    assert any(reason == "调度已暂停" for _name, reason in d.last_plan.waiting)
+    assert d.queue.get("p1").status == "pending"
+
+
+def test_paused_mutes_idle_notifications(cfg):
+    d = Daemon(cfg)
+    d.mode = MODE_IDLE
+    d._pause(time.time(), by="CLI")
+    before = len(d.notifier.sent)  # type: ignore[attr-defined]
+
+    d._notify_idle_gpus([0], time.time())
+
+    assert len(d.notifier.sent) == before, "暂停期间空闲提醒必须静音"  # type: ignore[attr-defined]
+
+
+def test_reap_requeues_paused_task_instead_of_failing(cfg, workdir):
+    d = Daemon(cfg)
+    task = make_running_task(d, cfg, workdir, log_age=0, uptime=10)
+    task.progress = {"epoch|10": [{"done": 3}]}
+    task.pause_requested = True
+    task.stop_requested = True
+    task.stop_reason = "pause"
+    task.pid = None  # 模拟进程已退出（测试里不真起进程）
+
+    d._reap_tasks(time.time())
+
+    assert task.status == "pending", "暂停导致的停止应重新排队，而不是 failed/cancelled"
+    assert task.progress == {} and task.pause_requested is False
+    events = StateStore.read_events(cfg.event_log, 20)
+    assert any(e.get("event") == "task_requeued_by_pause" for e in events)
+
+
+def test_pause_state_persists_and_restores(cfg):
+    d = Daemon(cfg)
+    d._pause(time.time(), by="飞书 ou_me")
+    d._persist(time.time())
+    assert d.state["paused"]["active"] is True
+
+    other = Daemon(cfg)
+    other.state = other.store.read()
+    other.queue.load(other.state)
+    other._recover_after_restart()
+
+    assert other.paused is True and other.paused_by == "飞书 ou_me"
+
+
+def test_control_request_is_applied_once(cfg):
+    d = Daemon(cfg)
+    d.request_control("pause", by="CLI")
+    d._apply_control_request(time.time())
+    assert d.paused is True
+
+    d._apply_control_request(time.time())  # 没有新请求 → 状态不变
+    assert d.paused is True and d._control_request == ""
+
+    d.request_control("resume", by="CLI")
+    d._apply_control_request(time.time())
+    assert d.paused is False
+
+
+def test_resume_resets_idle_signature(cfg):
+    d = Daemon(cfg)
+    d.state.setdefault("notify", {})["last_idle_signature"] = "0,1"
+    d._pause(time.time(), by="CLI")
+    d._resume(time.time(), by="CLI")
+    assert d.state["notify"]["last_idle_signature"] == ""
