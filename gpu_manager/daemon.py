@@ -1104,8 +1104,15 @@ class Daemon:
         notify_state["last_idle_signature"] = signature
 
     def _maybe_notify_queue_wait(self, now: float) -> None:
-        """排队久了给一次周期提醒，避免用户以为程序挂了。"""
+        """排队久了给一次周期提醒，避免用户以为程序挂了。
+
+        暂停调度期间**不发**：暂停本来就会让队列一直不动，再提醒「仍在等待」
+        只会刷屏。恢复后自动继续（计时器不重置，所以若暂停很久，恢复后的第一条
+        会如实说明已经等了多久）。
+        """
         if self.mode != MODE_QUEUE or not self.cfg.scheduler.queue_notify:
+            return
+        if self.paused:
             return
         interval = float(self.cfg.scheduler.waiting_notify_interval_seconds)
         if interval <= 0:

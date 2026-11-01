@@ -883,7 +883,8 @@ def test_paused_blocks_launching(cfg, workdir):
     d._launch_pending([0], time.time())
 
     assert any(reason == "调度已暂停" for _name, reason in d.last_plan.waiting)
-    assert d.queue.get("p1").status == "pending"
+    queued = d.queue.get("p1")
+    assert queued is not None and queued.status == "pending"
 
 
 def test_paused_mutes_idle_notifications(cfg):
@@ -948,3 +949,69 @@ def test_resume_resets_idle_signature(cfg):
     d._pause(time.time(), by="CLI")
     d._resume(time.time(), by="CLI")
     assert d.state["notify"]["last_idle_signature"] == ""
+
+
+# --------------------------------------------------------------------------- #
+# 「队列仍在等待」提醒（暂停期间停发，恢复后继续）
+# --------------------------------------------------------------------------- #
+def _set_queue_wait(d, *, last_at: float) -> None:
+    d.mode = MODE_QUEUE
+    d.state.setdefault("notify", {})["queue_wait_at"] = last_at
+
+
+def test_queue_wait_reminder_fires_when_due(cfg):
+    cfg.scheduler.waiting_notify_interval_seconds = 3600
+    d = Daemon(cfg)
+    now = time.time()
+    _set_queue_wait(d, last_at=now - 3601)
+    d.queue.add(make_spec("p1"))
+    before = len(d.notifier.sent)  # type: ignore[attr-defined]
+
+    d._maybe_notify_queue_wait(now)
+
+    assert len(d.notifier.sent) == before + 1, "到期且未暂停时应发提醒"  # type: ignore[attr-defined]
+
+
+def test_queue_wait_reminder_not_sent_before_interval(cfg):
+    cfg.scheduler.waiting_notify_interval_seconds = 10800
+    d = Daemon(cfg)
+    now = time.time()
+    _set_queue_wait(d, last_at=now - 3600)  # 只过了 1 小时，未到 3 小时
+    d.queue.add(make_spec("p1"))
+    before = len(d.notifier.sent)  # type: ignore[attr-defined]
+
+    d._maybe_notify_queue_wait(now)
+
+    assert len(d.notifier.sent) == before  # type: ignore[attr-defined]
+
+
+def test_queue_wait_reminder_muted_while_paused(cfg):
+    cfg.scheduler.waiting_notify_interval_seconds = 3600
+    d = Daemon(cfg)
+    now = time.time()
+    last_at = now - 100 * 3600
+    _set_queue_wait(d, last_at=last_at)
+    d.queue.add(make_spec("p1"))
+    d._pause(now, by="飞书 ou_me")
+    before = len(d.notifier.sent)  # type: ignore[attr-defined]
+
+    d._maybe_notify_queue_wait(now)
+
+    assert len(d.notifier.sent) == before, "暂停期间不得发「队列仍在等待」"  # type: ignore[attr-defined]
+    assert d.state["notify"]["queue_wait_at"] == last_at, "暂停期间不应刷新计时器"
+
+
+def test_queue_wait_reminder_resumes_after_unpause(cfg):
+    cfg.scheduler.waiting_notify_interval_seconds = 3600
+    d = Daemon(cfg)
+    now = time.time()
+    _set_queue_wait(d, last_at=now - 100 * 3600)
+    d.queue.add(make_spec("p1"))
+    d._pause(now, by="CLI")
+    d._maybe_notify_queue_wait(now)  # 暂停中：不发
+
+    d._resume(now, by="CLI")
+    before = len(d.notifier.sent)  # type: ignore[attr-defined]
+    d._maybe_notify_queue_wait(now)
+
+    assert len(d.notifier.sent) == before + 1, "恢复后应重新开启（已超期则立即发一条）"  # type: ignore[attr-defined]

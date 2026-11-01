@@ -835,8 +835,7 @@ class FeishuBot:
             self.logger.error("初始化飞书长连接失败: %s", exc)
             return False
 
-        # pi-lens-ignore: python-thread-global-write -- 长连接线程只读锁内快照（context_provider），
-        # 唯一共享写入是 _stop 标志与审计事件（append_event 内部有文件锁）
+        # pi-lens-ignore: python-thread-global-write -- 长连接线程只读锁内快照；写仅限 _stop 标志与带文件锁的审计事件
         self._thread = threading.Thread(target=self._run, name="gpu-manager-feishu-bot", daemon=True)
         self._thread.start()
         self.logger.info("飞书交互查询已启动（长连接）")

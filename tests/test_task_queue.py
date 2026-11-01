@@ -550,7 +550,7 @@ def test_finished_archive_survives_state_roundtrip(cfg):
     qm = make_qm(cfg)
     task = qm.add(spec(name="exp"))
     qm.mark_finished(task, status=COMPLETED, exit_code=0)
-    qm.purge_finished(before=task.finished_at + 1)
+    qm.purge_finished(before=(task.finished_at or 0.0) + 1)
 
     state: dict[str, Any] = {}
     qm.dump(state)
@@ -594,7 +594,7 @@ def test_explicit_add_clears_tombstone(cfg, workdir):
     qm = make_qm(cfg)
     task = qm.add(spec(name="exp"))
     qm.mark_finished(task, status=CANCELLED, exit_code=None)
-    qm.purge_finished(before=task.finished_at + 1)
+    qm.purge_finished(before=(task.finished_at or 0.0) + 1)
     assert "exp" in qm.finished
 
     qm.add(spec(name="exp"))

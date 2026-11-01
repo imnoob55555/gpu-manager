@@ -29,6 +29,7 @@ compatibility: 需要本机已安装 gpu-manager（clone 后 `pip install -e .`�
 4. **影响在跑训练的动作先问用户**：`cancel`、`pause`、`stop`/`restart` daemon、改 `config.yaml` 阈值。
    （`restart` 本身不杀训练任务，但会短暂停调度；`pause` 会**停掉运行中任务**并重新排队。）
 5. 改配置 → `gpu-manager reload` 即可；**改了代码/新增模块才需要 `restart`**。
+6. **验证写命令（pause/resume/cancel）一律在沙箱 config 下做** —— 绝不能为了「验证功能」在生产 daemon 上执行；生产上只执行用户明确要求的操作。
 
 ## 状态与查询
 
@@ -122,7 +123,7 @@ gpu-manager prune             # 立即清理
 - 推送：空闲提醒、任务启动/完成/失败、看门狗告警（`config.yaml` 的 `notify` / `feishu`）
 - 交互查询（**只读为主**，白名单 fail-closed）：发「状态」「队列」「预计」「日志 <任务> [行数]」「帮助」；
   **写操作只有「暂停」「恢复」**：暂停 = 停止运行中任务并重新排队（不判失败，当前 epoch 进度会丢）；
-  暂停期间空闲提醒静音、看门狗不报停滞，状态跨重启保持；「队列」最多回 10 个未完成 + 5 个已结束（72h 内），
+  暂停期间空闲提醒静音、「队列仍在等待」提醒停发、看门狗不报停滞，状态跨重启保持；「队列」最多回 10 个未完成 + 5 个已结束（72h 内），
   超窗的已结束记录会被 daemon 删除（`queue.finished_retention_hours`）
 - 没收到提醒先查：`gpu-manager doctor`；再看 `gpu-manager logs -n 50 | grep -E "通知|未授权"`
 

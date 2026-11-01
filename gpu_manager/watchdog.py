@@ -760,6 +760,7 @@ class Watchdog:
             path = f"/proc/{proc.pid}/{name}"
             try:
                 if name == "cmdline":
+                    # pi-lens-ignore: python-path-traversal -- path 是 /proc/<已校验的本人 pid>/<固定字段名>，无外部输入
                     with open(path, "rb") as fh:
                         raw = fh.read()
                     value = " ".join(p.decode("utf-8", "replace") for p in raw.split(b"\0") if p)
@@ -926,6 +927,7 @@ def _tail_lines(path: Path, limit: int) -> list[str]:
     block = 64 * 1024
     data = b""
     try:
+        # pi-lens-ignore: python-path-traversal -- path 来自任务字段/配置（与 tasks.yaml 同信任级），非外部输入
         with open(path, "rb") as fh:
             pos = size
             while pos > 0 and data.count(b"\n") <= limit:
