@@ -523,6 +523,14 @@ class BotTransport(Protocol):
         self, chat_id: str, text: str, *, reply_to: str | None = None
     ) -> tuple[bool, str]: ...
 
+    def send_card(
+        self, receive_id: str, card: dict[str, Any], *, receive_id_type: str = "open_id"
+    ) -> tuple[bool, str]:
+        """发送卡片消息；成功时第二个返回值是 ``message_id``（供后续原地更新）。"""
+        ...
+
+    def update_card(self, message_id: str, card: dict[str, Any]) -> tuple[bool, str]: ...
+
 
 class FeishuTransport:
     """真实发送: 优先用「回复消息」接口（话题聚合），失败则退化为普通发消息。
@@ -608,6 +616,63 @@ class FeishuTransport:
             headers=headers,
             allowed_hosts=self.allowed_hosts,
             allow_any_host=self.allow_any_host,
+        )
+        if not ok:
+            return False, str(data)
+        if data.get("code") in (0, None):
+            return True, "ok"
+        return False, f"飞书返回 code={data.get('code')} msg={data.get('msg')}"
+
+    # ------------------------------------------------------------------ #
+    # 卡片（常驻面板用）：发送 + 原地更新
+    # ------------------------------------------------------------------ #
+    def send_card(
+        self, receive_id: str, card: dict[str, Any], *, receive_id_type: str = "open_id"
+    ) -> tuple[bool, str]:
+        """发一张卡片；成功时返回 (True, message_id)。"""
+        from .notifier import _http_post_json
+
+        ok, token = self._tenant_token()
+        if not ok:
+            return False, token
+        content = json.dumps(card, ensure_ascii=False)
+        ok, data = _http_post_json(
+            f"{self.BASE}/im/v1/messages?receive_id_type={receive_id_type}",
+            {"receive_id": receive_id, "msg_type": "interactive", "content": content},
+            timeout=self.timeout,
+            headers={"Authorization": f"Bearer {token}"},
+            allowed_hosts=self.allowed_hosts,
+            allow_any_host=self.allow_any_host,
+        )
+        if not ok:
+            return False, str(data)
+        if data.get("code") in (0, None):
+            message_id = str((data.get("data") or {}).get("message_id") or "")
+            if message_id:
+                return True, message_id
+            return False, f"发送成功但未返回 message_id: {data}"
+        return False, f"飞书返回 code={data.get('code')} msg={data.get('msg')}"
+
+    def update_card(self, message_id: str, card: dict[str, Any]) -> tuple[bool, str]:
+        """原地更新已发送的卡片（飞书 PATCH /im/v1/messages/:message_id）。
+
+        注意：只有 14 天内发送的卡片能更新（错误码 230031），且必须带
+        ``config.update_multi = true`` —— 这两点由 panel 模块负责处理。
+        """
+        from .notifier import _http_post_json
+
+        ok, token = self._tenant_token()
+        if not ok:
+            return False, token
+        content = json.dumps(card, ensure_ascii=False)
+        ok, data = _http_post_json(
+            f"{self.BASE}/im/v1/messages/{message_id}",
+            {"content": content},
+            timeout=self.timeout,
+            headers={"Authorization": f"Bearer {token}"},
+            allowed_hosts=self.allowed_hosts,
+            allow_any_host=self.allow_any_host,
+            method="PATCH",
         )
         if not ok:
             return False, str(data)

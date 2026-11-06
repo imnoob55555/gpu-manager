@@ -248,6 +248,31 @@ class QueueConfig:
 
 
 @dataclass
+class FeishuPanelConfig:
+    """常驻「GPU 红绿灯」面板：一条共享卡片，内容原地刷新（不产生新消息）。
+
+    与 ``enabled``（出站通知）/ ``interactive_enabled``（入站查询）相互独立：
+    面板只需要应用凭证与出站权限，即使长连接不可用也能正常刷新。
+    """
+
+    enabled: bool = False
+    #: 心跳：没有变化时也刷一次，让「更新时间」/ETA 不过期
+    refresh_seconds: int = 120
+    #: 本地检查变化的间隔（只读快照，不产生 API 调用）
+    poll_seconds: int = 10
+    #: 面板收件人；留空 = 与通知同一目标（默认与机器人的私聊）
+    receive_id: str = ""
+    #: 留空 = 与 feishu.receive_id_type 一致
+    receive_id_type: str = ""
+
+    def resolved_target(self, feishu: "FeishuConfig") -> tuple[str, str]:
+        """返回 (receive_id, receive_id_type)，默认复用通知目标。"""
+        receive_id = (self.receive_id or "").strip() or feishu.resolved_receive_id()
+        receive_id_type = (self.receive_id_type or "").strip() or feishu.receive_id_type
+        return receive_id, receive_id_type
+
+
+@dataclass
 class FeishuConfig:
     """飞书集成（**唯一**一段）：出站通知与入站交互查询共用同一个自建应用。
 
@@ -288,6 +313,9 @@ class FeishuConfig:
     allowed_users: list[str] = field(default_factory=list)
     rate_limit_per_minute: int = 10
     log_lines_default: int = 20
+
+    # --- 常驻「GPU 红绿灯」面板（一张共享卡片，原地刷新）---
+    panel: FeishuPanelConfig = field(default_factory=FeishuPanelConfig)
 
     # --- ETA（预计结束时间）---
     eta_enabled: bool = True
@@ -360,6 +388,25 @@ class FeishuConfig:
         否则「查询没配好」会连累通知降级。
         """
         return self.interactive_warnings() + self.notification_warnings()
+
+    def panel_warnings(self) -> list[str]:
+        """常驻面板的配置自查（缺凭证 / 无收件人 / 间隔不合理）。"""
+        if not self.panel.enabled:
+            return []
+        warnings: list[str] = []
+        if not (self.app_id and self.app_secret):
+            warnings.append("feishu.panel.enabled=true 但 app_id/app_secret 未填 → 面板不会启动")
+        receive_id, receive_id_type = self.panel.resolved_target(self)
+        if not (receive_id and receive_id_type):
+            warnings.append(
+                "feishu.panel 没有收件人：panel.receive_id 为空，且 allowed_users 也为空"
+            )
+        if self.panel.poll_seconds > self.panel.refresh_seconds:
+            warnings.append(
+                f"feishu.panel.poll_seconds({self.panel.poll_seconds}) 大于"
+                f" refresh_seconds({self.panel.refresh_seconds}) → 心跳会退回按 refresh_seconds"
+            )
+        return warnings
 
 
 @dataclass
@@ -723,6 +770,26 @@ def _build(raw: dict[str, Any], base_dir: Path, source: Path | None) -> Config:
         fs.eta_patterns = [str(p) for p in patterns_raw if str(p).strip()]
     else:
         raise ConfigError("feishu.eta_patterns 必须是正则字符串列表")
+    # 常驻面板（一张共享卡片，原地刷新）
+    panel_raw = sec.get("panel")
+    if panel_raw is None:
+        pass
+    elif isinstance(panel_raw, dict):
+        fs.panel.enabled = _get_bool(panel_raw, "enabled", fs.panel.enabled, "feishu.panel")
+        fs.panel.refresh_seconds = _get_int(
+            panel_raw, "refresh_seconds", fs.panel.refresh_seconds, "feishu.panel", minimum=30
+        )
+        fs.panel.poll_seconds = _get_int(
+            panel_raw, "poll_seconds", fs.panel.poll_seconds, "feishu.panel", minimum=2
+        )
+        fs.panel.receive_id = _get_str(
+            panel_raw, "receive_id", fs.panel.receive_id, "feishu.panel"
+        )
+        fs.panel.receive_id_type = _get_str(
+            panel_raw, "receive_id_type", fs.panel.receive_id_type, "feishu.panel"
+        )
+    else:
+        raise ConfigError("feishu.panel 必须是映射（例如 panel.enabled: true）")
     fs.validate()
     cfg.feishu = fs
 

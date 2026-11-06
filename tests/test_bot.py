@@ -60,11 +60,26 @@ class FakeTransport:
 
     def __init__(self, ok: bool = True) -> None:
         self.sent: list[tuple[str, str, str | None]] = []
+        self.cards: list[tuple[str, str, dict]] = []
+        self.updates: list[tuple[str, dict]] = []
         self.ok = ok
+        self.card_ok = ok
+        self.update_ok = ok
+        self.update_detail = "fake-update"
 
     def send_text(self, chat_id: str, text: str, *, reply_to: str | None = None):
         self.sent.append((chat_id, text, reply_to))
         return self.ok, "fake-ok" if self.ok else "fake-fail"
+
+    def send_card(self, receive_id: str, card: dict, *, receive_id_type: str = "open_id"):
+        self.cards.append((receive_id, receive_id_type, card))
+        if not self.card_ok:
+            return False, "fake-card-fail"
+        return True, f"om_fake_{len(self.cards)}"
+
+    def update_card(self, message_id: str, card: dict):
+        self.updates.append((message_id, card))
+        return self.update_ok, "fake-update-ok" if self.update_ok else self.update_detail
 
 
 def make_context(**kw) -> BotContext:

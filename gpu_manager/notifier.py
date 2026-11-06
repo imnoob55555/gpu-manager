@@ -237,8 +237,12 @@ def _http_post_json(
     headers: dict[str, str] | None = None,
     allowed_hosts: Iterable[str] | None = None,
     allow_any_host: bool = False,
+    method: str = "POST",
 ) -> tuple[bool, Any]:
-    """返回 (是否 HTTP 成功, 解析后的 JSON 或错误字符串)。"""
+    """返回 (是否 HTTP 成功, 解析后的 JSON 或错误字符串)。
+
+    ``method`` 默认 POST；飞书「更新卡片」用的是 PATCH，其余调用不受影响。
+    """
     url_error = _validate_url(url, allowed_hosts, allow_any_host)
     if url_error:
         return False, url_error
@@ -251,7 +255,9 @@ def _http_post_json(
     session = _session()
     if session is not None:
         try:
-            resp = session.post(url, data=body, headers=request_headers, timeout=timeout, verify=verify)
+            resp = session.request(
+                method, url, data=body, headers=request_headers, timeout=timeout, verify=verify
+            )
         except Exception as exc:  # requests 异常体系复杂，统一兜住
             return False, f"{type(exc).__name__}: {exc}"
         if resp.status_code >= 400:
@@ -262,7 +268,7 @@ def _http_post_json(
             return False, f"响应非 JSON: {truncate(resp.text, 200)}"
 
     req = urllib.request.Request(  # noqa: S310 - scheme 与主机已由 _validate_url 白名单校验
-        url, data=body, headers=request_headers, method="POST"
+        url, data=body, headers=request_headers, method=method
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - 同上

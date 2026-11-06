@@ -125,6 +125,9 @@ gpu-manager prune             # 立即清理
   **写操作只有「暂停」「恢复」**：暂停 = 停止运行中任务并重新排队（不判失败，当前 epoch 进度会丢）；
   暂停期间空闲提醒静音、「队列仍在等待」提醒停发、看门狗不报停滞，状态跨重启保持；「队列」最多回 10 个未完成 + 5 个已结束（72h 内），
   超窗的已结束记录会被 daemon 删除（`queue.finished_retention_hours`）
+  - 常驻面板（`feishu.panel.enabled`）：一条共享卡片原地刷新（🟢可抢/🟡冷却/🔴他人/🔵我的），
+    变化即刷 + 每 `refresh_seconds` 心跳；14 天自动换卡；收件人默认同通知目标，需手动长按置顶。
+    `gpu-manager status` 的 `feishu.panel` 段可看是否在跑、是否已有卡片
 - 没收到提醒先查：`gpu-manager doctor`；再看 `gpu-manager logs -n 50 | grep -E "通知|未授权"`
 
 ## 排错（都是踩过的坑）

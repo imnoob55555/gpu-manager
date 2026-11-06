@@ -56,6 +56,7 @@ from .gpu_monitor import (
 from .idle_tracker import IdleTracker
 from .ipc import ControlServer, fail, ok
 from .notifier import Notifier, build_notifier
+from .panel import PanelRefresher
 from .retention import prune_all
 from .runner import RunHandle, RunnerError, TaskRunner
 from .scheduler import GpuCandidate, Plan, describe_plan, plan_assignments
@@ -176,6 +177,7 @@ class Daemon:
         self._control_by: str = ""
         self._paused_idle_logged: bool = False
         self.bot: FeishuBot | None = None
+        self.panel: PanelRefresher | None = None
         self.server: ControlServer | None = None
 
     # ================================================================== #
@@ -1437,6 +1439,9 @@ class Daemon:
     def _start_bot(self) -> None:
         """启动飞书交互式查询。任何问题都只记日志，绝不影响调度。"""
         fcfg = self.cfg.feishu
+        # 常驻面板与长连接相互独立：它只需要应用凭证 + 出站权限，
+        # 即使 lark-oapi 不可用/长连接起不来，面板也能正常刷新。
+        self._start_panel()
         if not fcfg.interactive_enabled:
             return
         if self.dry_run:
@@ -1490,6 +1495,69 @@ class Daemon:
             with contextlib.suppress(Exception):
                 self.bot.stop()
             self.bot = None
+        self._stop_panel()
+
+    # ------------------------------------------------------------------ #
+    # 常驻面板（一张共享卡片，原地刷新；纯出站，不新增入站命令）
+    # ------------------------------------------------------------------ #
+    def _start_panel(self) -> None:
+        """启动常驻红绿灯卡片；任何失败都只记日志。"""
+        fcfg = self.cfg.feishu
+        if not (fcfg.panel.enabled and fcfg.enabled) or self.dry_run:
+            return
+        for warning in fcfg.panel_warnings():
+            self.logger.warning("%s", warning)
+        receive_id, receive_id_type = fcfg.panel.resolved_target(fcfg)
+        if not (receive_id and receive_id_type and fcfg.app_id and fcfg.app_secret):
+            return
+        try:
+            transport = FeishuTransport(
+                fcfg.app_id,
+                fcfg.app_secret,
+                self.logger,
+                timeout=float(fcfg.timeout_seconds),
+                allowed_hosts=fcfg.allowed_hosts,
+                allow_any_host=fcfg.allow_any_host,
+            )
+            persisted = self.state.get("feishu_panel") or {}
+            refresher = PanelRefresher(
+                provider=self._bot_context,
+                transport=transport,
+                receive_id=receive_id,
+                receive_id_type=receive_id_type,
+                logger=self.logger,
+                persist=self._panel_persist,
+                initial_message_id=str(persisted.get("message_id") or ""),
+                initial_sent_at=float(persisted.get("sent_at") or 0.0),
+                heartbeat_seconds=float(fcfg.panel.refresh_seconds),
+                poll_seconds=float(fcfg.panel.poll_seconds),
+            )
+            refresher.start()
+        except Exception:
+            self.logger.exception("初始化常驻面板失败（继续运行调度）")
+            return
+        self.panel = refresher
+        self.logger.info(
+            "常驻面板已启动: 每 %ss 心跳 / %ss 检查变化（%s）",
+            fcfg.panel.refresh_seconds,
+            fcfg.panel.poll_seconds,
+            "复用上次的卡片" if refresher.has_card else "首次会新发一张卡片",
+        )
+
+    def _panel_persist(self, message_id: str, sent_at: float) -> None:
+        """只持久化「哪张卡片」。统一走 daemon 的锁，避开 state 落盘竞争。"""
+        with self.lock:
+            self.state.setdefault("feishu_panel", {}).update(
+                {"message_id": message_id, "sent_at": sent_at}
+            )
+
+    def _stop_panel(self) -> None:
+        panel = self.panel
+        if panel is not None:
+            with contextlib.suppress(Exception):
+                panel.stop()
+            self.logger.info("常驻面板已停止")
+            self.panel = None
 
     def _maybe_purge_finished(self, now: float) -> None:
         """按 ``queue.finished_retention_hours`` 删除过期的终态任务记录。
@@ -1808,6 +1876,12 @@ class Daemon:
                 "allowed_users": len(cfg.feishu.allowed_users),
                 "rate_limit_per_minute": cfg.feishu.rate_limit_per_minute,
                 "eta_enabled": cfg.feishu.eta_enabled,
+            },
+            "panel": {
+                "enabled": cfg.feishu.panel.enabled,
+                "running": self.panel is not None,
+                "refresh_seconds": cfg.feishu.panel.refresh_seconds,
+                "has_message": bool((self.state.get("feishu_panel") or {}).get("message_id")),
             },
             "paths": {
                 "config": str(cfg.source_path) if cfg.source_path else "",
