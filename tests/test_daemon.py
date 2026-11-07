@@ -499,6 +499,68 @@ def test_reload_restarts_bot(cfg, monkeypatch):
     assert calls == ["stop", "start"]
 
 
+def test_notify_toggle_via_control_request(cfg):
+    """飞书「提醒/静音」→ 运行时开关（不写配置文件），并记审计事件。"""
+    cfg.notify.on_gpu_idle = True
+    d = Daemon(cfg)
+    d.mode = MODE_IDLE
+
+    d.request_control("notify_off", by="飞书 ou_me")
+    d._apply_control_request(time.time())
+    before = len(d.notifier.sent)  # type: ignore[attr-defined]
+    d._notify_idle_gpus([0], time.time())
+    assert len(d.notifier.sent) == before, "静音后不应再推空闲提醒"  # type: ignore[attr-defined]
+    assert d.state["notify"]["idle_enabled"] is False
+    events = StateStore.read_events(cfg.event_log, 20)
+    assert any(
+        e.get("event") == "notify_idle_toggled" and e.get("enabled") is False for e in events
+    )
+
+    d.request_control("notify_on", by="飞书 ou_me")
+    d._apply_control_request(time.time())
+    d._notify_idle_gpus([0], time.time())
+    assert len(d.notifier.sent) == before + 1, "重新开启后应立即恢复提醒"  # type: ignore[attr-defined]
+
+
+def test_notify_toggle_persists_across_restart(cfg):
+    cfg.notify.on_gpu_idle = True
+    d = Daemon(cfg)
+    d.request_control("notify_off", by="飞书 ou_me")
+    d._apply_control_request(time.time())
+    d._persist(time.time())
+
+    other = Daemon(cfg)
+    other.state = other.store.read()
+    assert other._idle_notify_enabled() is False, "重启后应保持静音"
+
+
+def test_notify_default_follows_config_without_override(cfg):
+    cfg.notify.on_gpu_idle = False
+    assert Daemon(cfg)._idle_notify_enabled() is False
+    cfg.notify.on_gpu_idle = True
+    assert Daemon(cfg)._idle_notify_enabled() is True
+
+
+def test_notify_on_resets_cooldown_and_signature(cfg):
+    """静音 → 提醒 的转换会清冷却/签名（保证恢复后第一次空闲就能提醒）；
+    重复发「提醒」不会重置（否则等于给自己开个刷提醒的口子）。"""
+    cfg.notify.on_gpu_idle = True
+    d = Daemon(cfg)
+    d.state.setdefault("notify", {}).update({"idle_enabled": False})
+    d.state["notify"].update({"gpu_idle_at": 1.0, "last_idle_signature": "0"})
+    d.request_control("notify_on", by="飞书 ou_me")
+    d._apply_control_request(time.time())
+
+    assert "gpu_idle_at" not in d.state["notify"]
+    assert d.state["notify"]["last_idle_signature"] == ""
+
+    # 已经开启时再发一次「提醒」：不应重置（防止刷提醒）
+    d.state["notify"].update({"gpu_idle_at": 2.0, "last_idle_signature": "1"})
+    d.request_control("notify_on", by="飞书 ou_me")
+    d._apply_control_request(time.time())
+    assert d.state["notify"]["gpu_idle_at"] == 2.0
+
+
 def test_reload_restarts_panel_without_touching_bot(cfg, monkeypatch):
     """改 feishu.panel.* → 重建面板线程；长连接不受影响（无需重启 daemon）。"""
     d = Daemon(cfg)

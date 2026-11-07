@@ -61,7 +61,7 @@ scheduler:
 # 通知内容开关与去重
 # ---------------------------------------------------------------------------
 notify:
-  on_gpu_idle: true                 # 出现新的空闲 GPU（若开了 feishu.panel 常驻面板，可设为 false 避免重复提醒）
+  on_gpu_idle: true                 # 出现新的空闲 GPU（默认值；飞书发「提醒/静音」可运行时开关，开了常驻面板可设 false）
   on_task_queued: true              # 任务入队 / 进入排队模式
   on_task_started: true             # 任务启动
   on_task_finished: true            # 任务完成/取消

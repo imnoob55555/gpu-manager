@@ -521,7 +521,7 @@ class Daemon:
     # 暂停 / 恢复（写操作；仅白名单用户或 CLI 可触发）
     # ------------------------------------------------------------------ #
     def request_control(self, action: str, *, by: str = "") -> None:
-        """登记一个暂停/恢复请求（bot 线程与 IPC 线程的安全入口）。
+        """登记一个控制请求（暂停/恢复/提醒/静音；bot 线程与 IPC 线程的安全入口）。
 
         真正的状态变更在 tick 内应用 —— 与调度器串行，避免跨线程改队列；
         这里顺手唤醒主循环，所以从发消息到生效通常不到一轮 tick。
@@ -541,6 +541,10 @@ class Daemon:
             self._pause(now, by=by)
         elif action == "resume":
             self._resume(now, by=by)
+        elif action == "notify_on":
+            self._set_idle_notify(True, by=by)
+        elif action == "notify_off":
+            self._set_idle_notify(False, by=by)
 
     def _pause(self, now: float, *, by: str = "") -> None:
         """暂停调度：运行中任务优雅停止后**重新排队**，pending 不再启动。"""
@@ -608,6 +612,16 @@ class Daemon:
         """飞书写操作的唯一入口（白名单已在 bot 层校验过）。返回回执文案。"""
         self.request_control(action, by=f"飞书 {user}")
         wait = int(self.cfg.gpu.check_interval_seconds)
+        if action == "notify_on":
+            return (
+                "🔔 已受理开启「GPU 空闲/状态变化」提醒。"
+                f"下一轮 tick（≤{wait}s）生效；冷却与签名会重置，下一次确认到空闲就会推送。"
+            )
+        if action == "notify_off":
+            return (
+                "🔕 已受理静音「GPU 空闲/状态变化」提醒。"
+                "常驻面板仍在刷新，「状态」查询照旧；发「提醒」可重新开启。"
+            )
         if action == "pause":
             return (
                 "⏸️ 已受理暂停请求：运行中任务会被优雅停止并**重新排队**（不判失败），"
@@ -1037,6 +1051,32 @@ class Daemon:
         if not ok_sent:
             self.logger.warning("通知发送失败: %s", detail)
 
+    def _idle_notify_enabled(self) -> bool:
+        """「GPU 空闲/状态变化」提醒是否开启。
+
+        优先级：飞书「提醒/静音」的运行时开关（存 state，跨重启保持）> 配置文件默认值。
+        这样既能用配置表达默认偏好，又能随时在手机上临时开关。
+        """
+        override = (self.state.get("notify") or {}).get("idle_enabled")
+        if isinstance(override, bool):
+            return override
+        return bool(self.cfg.notify.on_gpu_idle)
+
+    def _set_idle_notify(self, enabled: bool, *, by: str = "") -> None:
+        """设置空闲提醒开关（tick 内调用；持久化在 state 里，重启后保持）。"""
+        notify_state = self.state.setdefault("notify", {})
+        was = self._idle_notify_enabled()
+        notify_state["idle_enabled"] = enabled
+        if enabled and not was:
+            # 重新开启时清冷却与签名：下一次确认到空闲就能立刻提醒
+            notify_state.pop("gpu_idle_at", None)
+            notify_state["last_idle_signature"] = ""
+        self.logger.info("空闲提醒已%s（来自 %s）", "开启" if enabled else "静音", by or "CLI")
+        self.store.append_event(
+            {"event": "notify_idle_toggled", "enabled": enabled, "by": by or "CLI"},
+            self.cfg.event_log,
+        )
+
     def _notify_idle_gpus(self, confirmed: list[int], now: float) -> None:
         """空闲 GPU 提醒。
 
@@ -1045,7 +1085,7 @@ class Daemon:
         （例如不在 scheduler_allowed_gpus 里的 GPU 0），避免与调度动作互相刷屏。
         """
         notify_state = self.state.setdefault("notify", {})
-        if not self.cfg.notify.on_gpu_idle:
+        if not self._idle_notify_enabled():
             return
         if self.paused:
             # 暂停期间静音空闲提醒（否则空着的卡会反复响）；恢复时会重置签名
@@ -1424,8 +1464,11 @@ class Daemon:
                 gpu_error=snapshot.error,
                 log_reader=self._bot_log_tail,
                 paused=self.paused,
+                idle_notify_enabled=self._idle_notify_enabled(),
                 pause_controller=lambda user: self._bot_control("pause", user),
                 resume_controller=lambda user: self._bot_control("resume", user),
+                notify_on_controller=lambda user: self._bot_control("notify_on", user),
+                notify_off_controller=lambda user: self._bot_control("notify_off", user),
                 # 回复上限与终态时间窗口（真正删除由 _maybe_purge_finished 负责）
                 queue_max_unfinished=cfg.queue.max_unfinished_in_reply,
                 queue_max_finished=cfg.queue.max_finished_in_reply,

@@ -66,6 +66,10 @@ COMMAND_ALIASES: dict[str, str] = {
     "队列": "tasks", "任务": "tasks", "list": "tasks", "tasks": "tasks", "queue": "tasks",
     "预计": "eta", "eta": "eta", "何时": "eta", "完成时间": "eta", "结束时间": "eta",
     "日志": "log", "log": "log", "logs": "log", "输出": "log",
+    "提醒": "notify_on", "开启提醒": "notify_on", "打开提醒": "notify_on",
+    "notify_on": "notify_on", "unmute": "notify_on",
+    "静音": "notify_off", "关闭提醒": "notify_off", "notify_off": "notify_off",
+    "mute": "notify_off",
     "暂停": "pause", "pause": "pause", "停止调度": "pause",
     "恢复": "resume", "resume": "resume", "继续": "resume", "开始调度": "resume",
     "帮助": "help", "help": "help", "?": "help", "？": "help", "命令": "help",
@@ -159,9 +163,13 @@ class BotContext:
     finished_window_seconds: float = 72 * 3600.0
     #: 调度是否处于暂停状态
     paused: bool = False
+    #: 「GPU 空闲/状态变化」提醒是否开启（运行时开关，可被「提醒/静音」切换）
+    idle_notify_enabled: bool = False
     #: 写操作回调（daemon 注入；None = 未启用）
     pause_controller: Callable[[str], str] | None = None
     resume_controller: Callable[[str], str] | None = None
+    notify_on_controller: Callable[[str], str] | None = None
+    notify_off_controller: Callable[[str], str] | None = None
 
 
 @dataclass
@@ -251,13 +259,15 @@ class MessageDeduper:
 # 命令路由（纯逻辑）
 # --------------------------------------------------------------------------- #
 HELP_TEXT = """\
-可用命令（除「暂停/恢复」外都只读）:
+可用命令（写操作只有 暂停/恢复/提醒/静音）:
   状态        GPU 利用率/显存/占用者/可调度性
   队列        任务列表（进度与预计结束）
   预计        运行中任务的预计结束 + 各卡预计空出时间
   日志 <任务名> [行数]   任务日志尾部（默认 20 行）
   暂停        暂停调度：停止运行中任务并重新排队（不判失败），不再启动新任务
   恢复        恢复调度：pending 任务重新开始排队
+  提醒        开启「GPU 空闲/状态变化」推送（静音后用它恢复）
+  静音        关闭「GPU 空闲/状态变化」推送（常驻面板不受影响）
   帮助        显示本说明"""
 
 
@@ -285,6 +295,10 @@ class CommandRouter:
             return self._control(ctx.pause_controller, "pause", user)
         if command == "resume":
             return self._control(ctx.resume_controller, "resume", user)
+        if command == "notify_on":
+            return self._control(ctx.notify_on_controller, "notify_on", user)
+        if command == "notify_off":
+            return self._control(ctx.notify_off_controller, "notify_off", user)
         if command == "status":
             return self.render_status(ctx)
         if command == "tasks":
@@ -302,9 +316,9 @@ class CommandRouter:
     def _control(
         self, controller: Callable[[str], str] | None, action: str, user: str
     ) -> str:
-        """执行写操作（暂停/恢复）。控制器由 daemon 注入，未注入时明确告知。"""
+        """执行写操作（暂停/恢复/提醒/静音）。控制器由 daemon 注入，未注入时明确告知。"""
         if controller is None:
-            return "暂停/恢复未启用（daemon 未注入控制器）。"
+            return "该写操作未启用（daemon 未注入控制器）。"
         try:
             return controller(user)
         except Exception as exc:  # 写操作异常不能把长连接线程搞挂
@@ -319,6 +333,11 @@ class CommandRouter:
         ]
         if ctx.paused:
             lines.append("⏸️ 调度已暂停（发「恢复」继续；pending 任务不会启动）")
+        lines.append(
+            "🔔 空闲提醒: 开启"
+            if ctx.idle_notify_enabled
+            else "🔕 空闲提醒: 已静音（发「提醒」开启）"
+        )
         if ctx.gpu_error and not ctx.gpus:
             lines.append(f"⚠️ nvidia-smi 读取失败: {truncate(ctx.gpu_error, 200)}")
             return self._finish(lines)

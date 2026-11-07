@@ -192,9 +192,9 @@ gpu:
 
 - 空闲提醒按「空闲卡集合签名 + 冷却时间(`idle_cooldown_seconds`)」去重，避免 checkpoint
   导致 util 波动时刷屏
-- **开了常驻面板就建议关掉空闲推送**：`notify.on_gpu_idle: false`。
-  面板已经随状态变化实时刷新，再推一条「GPU 空闲」短信只是重复打扰；
-  任务起止/失败、看门狗告警、排队等待提醒不受影响，「状态」查询照旧返回详细占用
+- **空闲推送可由飞书运行时开关**：发「提醒」开启、发「静音」关闭（状态存在
+  `state.json`，跨重启保持）。配置文件里的 `notify.on_gpu_idle` 只作为**默认值**；
+  任务起止/失败、看门狗告警、排队等待提醒不受该开关影响，「状态」查询照旧返回详细占用
 - IDLE 模式：上报所有确认空闲的卡；QUEUE/RUNNING 模式：只上报「调度器不会用、但你能手动用」
   的卡（避免与调度动作互相刷屏）
 - 排队超过 `waiting_notify_interval_seconds`（默认 3600s）会周期性提醒一次等待原因；
@@ -287,10 +287,12 @@ gpu-manager watchdog diagnostics exp1 --show   # 打印某任务最新一份摘�
 | `日志 <任务名> [行数]` | 该任务日志尾部（默认 20 行） |
 | `暂停` | 暂停调度：停止运行中任务并重新排队（不判失败），pending 不再启动 |
 | `恢复` | 恢复调度：pending 任务按优先级重新排队 |
+| `提醒` | 开启「GPU 空闲/状态变化」推送（静音后用它恢复；冷却与签名会重置） |
+| `静音` | 关闭「GPU 空闲/状态变化」推送（常驻面板与「状态」查询不受影响） |
 | `帮助` | 命令表 |
 
-- **只读为主**：除「暂停 / 恢复」外全部只读；这两个写操作也必须通过 `feishu.allowed_users` 白名单，
-  且全量审计到 `events.jsonl`（`scheduler_paused` / `scheduler_resumed`）
+- **只读为主**：写操作只有 `暂停 / 恢复 / 提醒 / 静音`，全部必须通过 `feishu.allowed_users` 白名单，
+    且全量审计到 `events.jsonl`（`scheduler_paused` / `scheduler_resumed` / `notify_idle_toggled`）
 - **fail-closed 白名单**：`feishu.allowed_users` 为空时拒绝所有人；
   未授权消息不回内容，只在日志里打印对方 open_id（方便你加入白名单）
 - 预计结束时间由日志进度（tqdm / `Epoch x/y` / `step x/y`）两点采样外推；
@@ -314,8 +316,9 @@ gpu-manager watchdog diagnostics exp1 --show   # 打印某任务最新一份摘�
 - **置顶要手动点一次**：飞书没有给机器人开放 pin API，长按该消息 → 置顶即可固定在最上面
 - **14 天限制自动兜底**：飞书只允许更新 14 天内发送的卡片，daemon 会在第 13 天换发一张新卡，用户无感
 - 配置在 `feishu.panel.*`；关闭它不影响通知与交互查询（三者开关相互独立）
-- 面板替代的是「空闲 GPU 推送」：可以同时设 `notify.on_gpu_idle: false`，
-  只保留面板 + 任务起止/失败通知 + 「状态」查询
+- 面板替代的是「空闲 GPU 推送」：默认 `notify.on_gpu_idle: false`；
+  想临时要推送就发「提醒」，不想收就发「静音」——**运行时开关，重启后仍保持**，
+  不改配置文件也不影响面板与「状态」查询
 - **重启不重发**：卡片 message_id 落在 `data/state.json`，重启后继续更新同一条
 
 ---

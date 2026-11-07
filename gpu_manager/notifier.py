@@ -271,6 +271,7 @@ def _http_post_json(
         url, data=body, headers=request_headers, method=method
     )
     try:
+        # pi-lens-ignore: Semgrep:python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected -- url 由 _validate_url 强制 http/https + 主机白名单，file:// 会被拒；仅 requests 不可用时的降级通道
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - 同上
             raw = resp.read().decode("utf-8", errors="replace")
         return True, json.loads(raw)

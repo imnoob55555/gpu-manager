@@ -728,6 +728,49 @@ def test_status_shows_paused_badge():
     assert "调度已暂停" not in CommandRouter().handle("状态", make_context(paused=False))
 
 
+def test_notify_toggle_commands_call_controllers():
+    calls: list[tuple[str, str]] = []
+
+    def on(user: str) -> str:
+        calls.append(("on", user))
+        return "已受理开启提醒"
+
+    def off(user: str) -> str:
+        calls.append(("off", user))
+        return "已受理静音"
+
+    ctx = make_context(notify_on_controller=on, notify_off_controller=off)
+    router = CommandRouter()
+    assert router.handle("提醒", ctx, "ou_me") == "已受理开启提醒"
+    assert router.handle("静音", ctx, "ou_me") == "已受理静音"
+    assert calls == [("on", "ou_me"), ("off", "ou_me")]
+
+
+def test_notify_toggle_aliases():
+    for text in ("提醒", "开启提醒", "打开提醒", "notify_on", "unmute", "UNMUTE"):
+        assert CommandRouter.normalize(text)[0] == "notify_on", text
+    for text in ("静音", "关闭提醒", "notify_off", "mute", "MUTE"):
+        assert CommandRouter.normalize(text)[0] == "notify_off", text
+
+
+def test_notify_toggle_without_controller_is_explicit():
+    ctx = make_context(notify_on_controller=None, notify_off_controller=None)
+    assert "未启用" in CommandRouter().handle("提醒", ctx, "ou_me")
+    assert "未启用" in CommandRouter().handle("静音", ctx, "ou_me")
+
+
+def test_status_shows_idle_notify_state():
+    muted = CommandRouter().handle("状态", make_context(idle_notify_enabled=False))
+    assert "静音" in muted
+    loud = CommandRouter().handle("状态", make_context(idle_notify_enabled=True))
+    assert "静音" not in loud and "开启" in loud
+
+
+def test_help_mentions_notify_toggle():
+    text = CommandRouter().handle("帮助", make_context())
+    assert "提醒" in text and "静音" in text
+
+
 def test_help_mentions_pause_and_resume():
     text = CommandRouter().handle("帮助", make_context())
     assert "暂停" in text and "恢复" in text
