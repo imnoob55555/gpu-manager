@@ -192,6 +192,9 @@ gpu:
 
 - 空闲提醒按「空闲卡集合签名 + 冷却时间(`idle_cooldown_seconds`)」去重，避免 checkpoint
   导致 util 波动时刷屏
+- **开了常驻面板就建议关掉空闲推送**：`notify.on_gpu_idle: false`。
+  面板已经随状态变化实时刷新，再推一条「GPU 空闲」短信只是重复打扰；
+  任务起止/失败、看门狗告警、排队等待提醒不受影响，「状态」查询照旧返回详细占用
 - IDLE 模式：上报所有确认空闲的卡；QUEUE/RUNNING 模式：只上报「调度器不会用、但你能手动用」
   的卡（避免与调度动作互相刷屏）
 - 排队超过 `waiting_notify_interval_seconds`（默认 3600s）会周期性提醒一次等待原因；
@@ -311,6 +314,8 @@ gpu-manager watchdog diagnostics exp1 --show   # 打印某任务最新一份摘�
 - **置顶要手动点一次**：飞书没有给机器人开放 pin API，长按该消息 → 置顶即可固定在最上面
 - **14 天限制自动兜底**：飞书只允许更新 14 天内发送的卡片，daemon 会在第 13 天换发一张新卡，用户无感
 - 配置在 `feishu.panel.*`；关闭它不影响通知与交互查询（三者开关相互独立）
+- 面板替代的是「空闲 GPU 推送」：可以同时设 `notify.on_gpu_idle: false`，
+  只保留面板 + 任务起止/失败通知 + 「状态」查询
 - **重启不重发**：卡片 message_id 落在 `data/state.json`，重启后继续更新同一条
 
 ---

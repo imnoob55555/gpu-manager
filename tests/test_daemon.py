@@ -499,6 +499,24 @@ def test_reload_restarts_bot(cfg, monkeypatch):
     assert calls == ["stop", "start"]
 
 
+def test_reload_restarts_panel_without_touching_bot(cfg, monkeypatch):
+    """改 feishu.panel.* → 重建面板线程；长连接不受影响（无需重启 daemon）。"""
+    d = Daemon(cfg)
+    calls: list[str] = []
+    monkeypatch.setattr(d, "_stop_panel", lambda: calls.append("panel-stop"))
+    monkeypatch.setattr(d, "_start_panel", lambda: calls.append("panel-start"))
+    monkeypatch.setattr(d, "_stop_bot", lambda: calls.append("bot-stop"))
+    monkeypatch.setattr(d, "_start_bot", lambda: calls.append("bot-start"))
+    raw = yaml.safe_load(cfg.source_path.read_text(encoding="utf-8")) or {}
+    raw.setdefault("feishu", {})["panel"] = {"enabled": True, "refresh_seconds": 60}
+    # pi-lens-ignore: python-path-traversal -- 目标是 pytest tmp_path 内的临时文件
+    cfg.source_path.write_text(yaml.safe_dump(raw, allow_unicode=True), encoding="utf-8")
+
+    d._reload_config()
+
+    assert calls == ["panel-stop", "panel-start"], "只应重建面板，不碰长连接"
+
+
 def test_reload_updates_allowlist_in_place_without_restart(cfg, monkeypatch):
     """回归: 改白名单不应重建长连接。
 
@@ -896,6 +914,19 @@ def test_paused_mutes_idle_notifications(cfg):
     d._notify_idle_gpus([0], time.time())
 
     assert len(d.notifier.sent) == before, "暂停期间空闲提醒必须静音"  # type: ignore[attr-defined]
+
+
+def test_idle_notifications_can_be_disabled(cfg):
+    """面板常驻后，空闲推送可以关掉（不影响日志与「状态」查询）。"""
+    cfg.notify.on_gpu_idle = False
+    d = Daemon(cfg)
+    d.mode = MODE_IDLE
+    before = len(d.notifier.sent)  # type: ignore[attr-defined]
+
+    d._notify_idle_gpus([0], time.time())
+
+    assert len(d.notifier.sent) == before  # type: ignore[attr-defined]
+    assert "gpu_idle_at" not in d.state.get("notify", {}), "关掉后不该记冷却时间戳"
 
 
 def test_reap_requeues_paused_task_instead_of_failing(cfg, workdir):

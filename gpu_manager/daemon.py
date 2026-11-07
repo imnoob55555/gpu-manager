@@ -1688,6 +1688,17 @@ class Daemon:
         # 白名单/限流/日志行数属于「处理消息时才读」的设置，**原地更新**即可生效 ——
         # 这很重要: lark-oapi 的 ws.Client 没有公开的 stop，重建会留下旧连接
         # 继续消费事件（并被旧白名单拒绝），且旧连接无法可靠关闭。
+        # 常驻面板：开关/间隔/收件人变化时重建刷新线程（不需要重启 daemon）
+        panel_changed = (
+            old_cfg.feishu.panel != new_cfg.feishu.panel
+            or old_cfg.feishu.enabled != new_cfg.feishu.enabled
+            or old_cfg.feishu.app_id != new_cfg.feishu.app_id
+            or old_cfg.feishu.app_secret != new_cfg.feishu.app_secret
+        )
+        if panel_changed:
+            self._stop_panel()
+            self._start_panel()
+
         restart_bot = (
             old_cfg.feishu.interactive_enabled != new_cfg.feishu.interactive_enabled
             or old_cfg.feishu.app_id != new_cfg.feishu.app_id
